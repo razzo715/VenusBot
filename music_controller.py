@@ -21,6 +21,7 @@ from scripts.voice_engine import (
     InterruptibleOpusSource,
     ItalianSpeechSink,
     ItalianTTSEngine,
+    QueuedOpusSource,
 )
 from scripts.ytDLP import VideoSearcher, getSongExpiration
 
@@ -66,6 +67,7 @@ class MusicController:
         self.spotify = SpotifyController()
         self.ai_assistant = AIAssistant()
         self.tts_engine = ItalianTTSEngine()
+        self._keywords = BotKeywords()
 
         self.voiceChannel: Optional[discord.VoiceChannel] = None
         self.textChannel: Optional[discord.TextChannel] = None
@@ -176,12 +178,23 @@ class MusicController:
         Controlla periodicamente che l'ascolto vocale (ItalianSpeechSink) sia sempre attivo
         mentre il bot è nel canale vocale, riavviandolo automaticamente se si interrompe.
         """
+        missed_checks = 0
         try:
             while True:
                 await asyncio.sleep(4.0)
                 if not self.isConnectedToVC():
-                    await self._cleanup_stale_voice_client()
-                    break
+                    # Durante una riconnessione vocale di Discord (cambio server, rete instabile) il
+                    # voice client risulta disconnesso per qualche secondo: pulisci solo se la connessione
+                    # non torna. Prima un controllo capitato in quel momento faceva uscire il bot dal canale.
+                    missed_checks += 1
+                    if missed_checks >= 3:
+                        logging.warning(
+                            f"[Watchdog Vocale] Connessione vocale persa su {self.guild.name}, pulizia sessione."
+                        )
+                        await self._cleanup_stale_voice_client()
+                        break
+                    continue
+                missed_checks = 0
 
                 voice_client = self._get_voice_client()
                 if (
@@ -498,9 +511,19 @@ class MusicController:
             except Exception as e:
                 logging.debug(f"Errore riproduzione suono attivazione: {e}")
 
+    @staticmethod
+    def _make_tts_audio(tts_file: Path) -> discord.FFmpegOpusAudio:
+        return discord.FFmpegOpusAudio(
+            str(tts_file),
+            before_options="-loglevel error",
+            options='-vn -loglevel error -filter:a "volume=1.15"',
+        )
+
     async def speakInVC(self, text: str) -> None:
         """
         Pronuncia il testo in italiano direttamente nel canale vocale (modalità Solo Voce):
+        - Le frasi della risposta vengono sintetizzate in parallelo: il bot inizia a parlare appena
+          è pronta la prima, senza aspettare la sintesi dell'intera risposta.
         - Se c'è musica in riproduzione, la mette temporaneamente in pausa tramite InterruptibleOpusSource,
           parla e poi riprende la canzone dal punto esatto in cui si era fermata.
         - Se non c'è musica in riproduzione, riproduce direttamente l'audio TTS sul voice_client.
@@ -510,25 +533,49 @@ class MusicController:
         if not self.isConnectedToVC():
             return
 
-        async with self._tts_lock:
-            tts_file: Optional[Path] = None
-            try:
-                tts_file = await self.tts_engine.synthesize_to_file(text)
-                if not tts_file or not tts_file.exists():
+        chunks = self.tts_engine.split_for_speech(text)
+        if not chunks:
+            return
+        # La sintesi parte subito, anche mentre il chime o una risposta precedente stanno ancora suonando
+        synth_tasks = [asyncio.ensure_future(self.tts_engine.synthesize_to_file(c)) for c in chunks]
+        feeder: Optional[asyncio.Task] = None
+
+        try:
+            async with self._tts_lock:
+                first_file: Optional[Path] = None
+                next_idx = 0
+                while first_file is None and next_idx < len(synth_tasks):
+                    try:
+                        first_file = await synth_tasks[next_idx]
+                    except Exception as e:
+                        logging.debug(f"Sintesi TTS fallita: {e}")
+                    next_idx += 1
+                if not first_file or not first_file.exists():
                     return
 
                 voice_client = self._get_voice_client()
                 if not voice_client or not self.isConnectedToVC():
                     return
 
-                tts_opus = discord.FFmpegOpusAudio(
-                    str(tts_file),
-                    before_options="-loglevel error",
-                    options='-vn -loglevel error -filter:a "volume=1.15"',
-                )
+                tts_source = QueuedOpusSource(self._make_tts_audio(first_file))
+
+                async def _feed_remaining_chunks(remaining):
+                    try:
+                        for task in remaining:
+                            try:
+                                chunk_file = await task
+                            except Exception:
+                                chunk_file = None
+                            if chunk_file and chunk_file.exists():
+                                tts_source.append(self._make_tts_audio(chunk_file))
+                    finally:
+                        tts_source.close_input()
+
+                feeder = asyncio.ensure_future(_feed_remaining_chunks(synth_tasks[next_idx:]))
 
                 done_event = asyncio.Event()
                 loop = self.client.loop
+                max_wait = 20.0 + 0.08 * len(text)
 
                 # Caso 1: Musica attiva o in pausa gestita da InterruptibleOpusSource
                 if (
@@ -547,12 +594,12 @@ class MusicController:
                                 pass
                         loop.call_soon_threadsafe(done_event.set)
 
-                    self.current_audio_source.interrupt_with(tts_opus, on_end=_on_tts_end)
+                    self.current_audio_source.interrupt_with(tts_source, on_end=_on_tts_end)
                     if was_paused:
                         voice_client.resume()
 
                     start_wait = time.monotonic()
-                    while not done_event.is_set() and (time.monotonic() - start_wait) < 20.0:
+                    while not done_event.is_set() and (time.monotonic() - start_wait) < max_wait:
                         if not self.isConnectedToVC() or (
                             not voice_client.is_playing() and not voice_client.is_paused()
                         ):
@@ -573,9 +620,9 @@ class MusicController:
                         loop.call_soon_threadsafe(done_event.set)
 
                     if not voice_client.is_playing():
-                        voice_client.play(tts_opus, after=_after_standalone_tts)
+                        voice_client.play(tts_source, after=_after_standalone_tts)
                         start_wait = time.monotonic()
-                        while not done_event.is_set() and (time.monotonic() - start_wait) < 20.0:
+                        while not done_event.is_set() and (time.monotonic() - start_wait) < max_wait:
                             if not self.isConnectedToVC() or not voice_client.is_playing():
                                 break
                             try:
@@ -586,14 +633,22 @@ class MusicController:
                         if not done_event.is_set() and voice_client.is_playing():
                             if hasattr(voice_client, "stop_playing"):
                                 voice_client.stop_playing()
-            except Exception as e:
-                logging.error(f"Errore in speakInVC: {e}")
-            finally:
-                if (
-                    tts_file
-                    and tts_file.exists()
-                    and not tts_file.name.startswith("cached_")
-                ):
+                    else:
+                        tts_source.cleanup()
+        except Exception as e:
+            logging.error(f"Errore in speakInVC: {e}")
+        finally:
+            if feeder is not None and not feeder.done():
+                feeder.cancel()
+            for task in synth_tasks:
+                if not task.done():
+                    task.cancel()
+                    continue
+                try:
+                    tts_file = task.result()
+                except BaseException:
+                    continue
+                if tts_file and tts_file.exists() and not tts_file.name.startswith("cached_"):
                     try:
                         tts_file.unlink()
                     except Exception:
@@ -819,12 +874,32 @@ class MusicController:
             self._ensure_watchdog()
             return None
 
+    def _is_command_candidate(self, user: discord.Member, text: str) -> bool:
+        """
+        Chiamata dai thread di trascrizione: True se la frase è rivolta all'assistente
+        (contiene la parola di attivazione o l'utente è in una finestra di ascolto attivo).
+        Serve a fare i passaggi STT extra (più lenti) solo quando servono davvero.
+        """
+        now_mono = time.monotonic()
+        if (
+            self._active_song_listener_until.get(user.id, 0.0) > now_mono
+            or self._active_listener_until.get(user.id, 0.0) > now_mono
+        ):
+            return True
+        return self._keywords.contains_wake_word_sync(text)
+
     async def startVoiceRecording(self):
         """Avvia l'ascolto continuo in italiano nel canale vocale."""
+        def _log_handler_error(fut) -> None:
+            # Senza questo controllo un errore nella gestione di un comando vocale spariva nel nulla
+            if not fut.cancelled() and fut.exception() is not None:
+                logging.error("Errore nella gestione di un comando vocale", exc_info=fut.exception())
+
         def on_transcription(user: discord.Member, text: str):
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self.handleTranscribedAudio(user, text), self.client.loop
             )
+            fut.add_done_callback(_log_handler_error)
 
         voice_client = self._get_voice_client()
         if not voice_client or not self.isConnectedToVC():
@@ -832,9 +907,15 @@ class MusicController:
         try:
             if hasattr(voice_client, "is_listening") and voice_client.is_listening():
                 voice_client.stop_listening()
-            sink = ItalianSpeechSink(on_transcription=on_transcription, language="it-IT")
+            sink = ItalianSpeechSink(
+                on_transcription=on_transcription,
+                language="it-IT",
+                is_command_candidate=self._is_command_candidate,
+                get_wake_words=self._keywords.get_wake_words_sync,
+            )
             voice_client.listen(sink)
             self.client.loop.create_task(self.tts_engine.prewarm_common_phrases())
+            self.client.loop.create_task(self.ai_assistant.prewarm())
             logging.info(f"Ascolto vocale in italiano attivo su: {self.guild.name}")
         except Exception as e:
             logging.exception(f"Errore avvio ascolto vocale: {e}")
@@ -854,17 +935,20 @@ class MusicController:
             except Exception as e:
                 logging.debug(f"Errore invio trascrizione: {e}")
 
-        word_counters_data = await WordCounter().loadWordCounters()
-        keywords_map = word_counters_data[0] if word_counters_data else {}
-        text_lower = text.lower()
-        if any(
-            re.search(rf"\b{re.escape(kw)}\b", text_lower)
-            for kw in keywords_map.keys()
-        ):
-            await self.handle_word_counter_keyword(user, text_lower)
+        try:
+            word_counters_data = await WordCounter().loadWordCounters()
+            keywords_map = word_counters_data[0] if word_counters_data else {}
+            text_lower = text.lower()
+            if any(
+                re.search(rf"\b{re.escape(kw)}\b", text_lower)
+                for kw in keywords_map.keys()
+            ):
+                await self.handle_word_counter_keyword(user, text_lower)
+        except Exception as e:
+            # Un errore dei contatori (es. permessi del canale testuale) non deve bloccare l'assistente
+            logging.warning(f"Errore contatori parole: {e}")
 
-        kw_manager = BotKeywords()
-        activated, matched_wake, remainder = await kw_manager.extractCommandAfterWakeWord(text)
+        activated, matched_wake, remainder = self._keywords.extract_command_sync(text)
         force_song_mode = False
 
         # 1. Controlla se l'utente è nella finestra di ascolto canzone (dopo aver detto "Venus, metti...")
@@ -911,6 +995,10 @@ class MusicController:
             force_song_mode=force_song_mode,
         )
 
+        # Mentre il chime finisce di suonare, sintetizza già la risposta vocale
+        if assistant_resp.voice_reply and self.isConnectedToVC():
+            self.tts_engine.prefetch(assistant_resp.voice_reply)
+
         await chime_task
         await self.executeAssistantResponse(user, assistant_resp)
 
@@ -919,16 +1007,22 @@ class MusicController:
         query = resp.query
         voice_reply = resp.voice_reply
 
+        # Le finestre di ascolto si aprono PRIMA di parlare: se l'utente risponde mentre
+        # il bot sta ancora dicendo "Dimmi il titolo." la frase non va persa.
         if action == "listen_followup":
             # Il suono di attivazione (chime) ha già suonato! Apri la finestra di ascolto attivo di 10 secondi.
+            self._active_listener_until[user.id] = time.monotonic() + 10.0
             if voice_reply:
                 await self.speakInVC(voice_reply)
-            self._active_listener_until[user.id] = time.monotonic() + 10.0
+                if self._active_listener_until.get(user.id, 0.0) > time.monotonic():
+                    self._active_listener_until[user.id] = time.monotonic() + 10.0
             return
 
         if action == "listen_song_followup":
-            await self.speakInVC(voice_reply or "Dimmi il titolo.")
             self._active_song_listener_until[user.id] = time.monotonic() + 12.0
+            await self.speakInVC(voice_reply or "Dimmi il titolo.")
+            if self._active_song_listener_until.get(user.id, 0.0) > time.monotonic():
+                self._active_song_listener_until[user.id] = time.monotonic() + 12.0
             return
 
         if action == "none":

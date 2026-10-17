@@ -1,6 +1,7 @@
 import array
 import asyncio
 import audioop
+import base64
 import hashlib
 import io
 import logging
@@ -11,12 +12,14 @@ import struct
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 import wave
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import discord
 from discord.opus import Decoder, OpusError
@@ -29,7 +32,9 @@ from discord.ext.voice_recv import voice_client as vr_vc
 from discord.ext.voice_recv.rtp import SilencePacket
 from dotenv import load_dotenv
 import requests
+from requests.adapters import HTTPAdapter
 import speech_recognition as sr
+from urllib3.util.retry import Retry
 
 try:
     import davey
@@ -105,6 +110,14 @@ def patch_voice_recv_for_dave() -> None:
         if hasattr(self, "_dave_bad"):
             self._dave_bad.clear()
 
+    def _count_dave_drop(self, reason: str) -> None:
+        # Pacchetti vocali scartati prima dello STT: se succede spesso il bot "non sente" chi parla
+        self._dave_drops = getattr(self, "_dave_drops", 0) + 1
+        if self._dave_drops == 1 or self._dave_drops % 250 == 0:
+            logging.warning(
+                f"[Audio] {self._dave_drops} pacchetti vocali scartati (ssrc={self.ssrc}, motivo: {reason})"
+            )
+
     def _dave_decrypt_inner(self, packet: Any) -> bool:
         if packet.is_silence():
             return True
@@ -116,12 +129,14 @@ def patch_voice_recv_for_dave() -> None:
 
         session = getattr(state, "dave_session", None)
         if session is None or not session.ready:
+            self._count_dave_drop("sessione E2EE DAVE non pronta")
             return False
 
         user_id = self._cached_id
         if user_id is None:
             user_id = self._cached_id = vc._get_id_from_ssrc(self.ssrc)
         if user_id is None:
+            self._count_dave_drop("utente non ancora associato al flusso audio")
             return False
 
         try:
@@ -134,7 +149,7 @@ def patch_voice_recv_for_dave() -> None:
                 raise
             if "UnencryptedWhenPassthroughDisabled" in (str(e) or repr(e)):
                 return True
-            self._dave_drops = getattr(self, "_dave_drops", 0) + 1
+            self._count_dave_drop(f"decifratura E2EE fallita: {type(e).__name__}")
             return False
 
     def _dave_decrypt(self, packet: Any, *, peek: bool = False) -> bool:
@@ -203,6 +218,7 @@ def patch_voice_recv_for_dave() -> None:
 
     vr_opus.PacketDecoder.__init__ = _patched_init
     vr_opus.PacketDecoder.reset = _patched_reset
+    vr_opus.PacketDecoder._count_dave_drop = _count_dave_drop
     vr_opus.PacketDecoder._dave_decrypt_inner = _dave_decrypt_inner
     vr_opus.PacketDecoder._dave_decrypt = _dave_decrypt
     vr_opus.PacketDecoder._decode_safe = _decode_safe
@@ -319,6 +335,90 @@ class InterruptibleOpusSource(discord.AudioSource):
                 pass
 
 
+OPUS_SILENCE_FRAME = b"\xf8\xff\xfe"
+
+
+class QueuedOpusSource(discord.AudioSource):
+    """
+    Riproduce in sequenza più sorgenti Opus (le frasi di una risposta TTS sintetizzate in parallelo):
+    la prima frase parte appena è pronta mentre le successive vengono accodate senza buchi.
+    Se la frase successiva non è ancora pronta invia frame di silenzio, così la musica resta in pausa.
+    """
+
+    MAX_WAIT_FRAMES = 400  # 8 secondi di attesa massima tra una frase e l'altra
+
+    def __init__(self, first_source: discord.AudioSource):
+        super().__init__()
+        self._sources: deque = deque([first_source])
+        self._current: Optional[discord.AudioSource] = None
+        self._input_closed = False
+        self._waited_frames = 0
+        self._lock = threading.Lock()
+
+    def is_opus(self) -> bool:
+        return True
+
+    def append(self, source: discord.AudioSource) -> bool:
+        with self._lock:
+            if not self._input_closed:
+                self._sources.append(source)
+                return True
+        try:
+            source.cleanup()
+        except Exception:
+            pass
+        return False
+
+    def close_input(self) -> None:
+        """Nessun'altra frase in arrivo: la sorgente termina quando l'ultima frase finisce."""
+        with self._lock:
+            self._input_closed = True
+
+    def read(self) -> bytes:
+        while True:
+            with self._lock:
+                if self._current is None:
+                    if self._sources:
+                        self._current = self._sources.popleft()
+                    elif self._input_closed:
+                        return b""
+                    else:
+                        self._waited_frames += 1
+                        if self._waited_frames > self.MAX_WAIT_FRAMES:
+                            return b""
+                        return OPUS_SILENCE_FRAME
+                current = self._current
+                self._waited_frames = 0
+
+            try:
+                data = current.read()
+            except Exception:
+                data = b""
+            if data:
+                return data
+
+            try:
+                current.cleanup()
+            except Exception:
+                pass
+            with self._lock:
+                if self._current is current:
+                    self._current = None
+
+    def cleanup(self) -> None:
+        with self._lock:
+            self._input_closed = True
+            pending = list(self._sources)
+            self._sources.clear()
+            current, self._current = self._current, None
+        for src in [current, *pending]:
+            if src is not None:
+                try:
+                    src.cleanup()
+                except Exception:
+                    pass
+
+
 class ItalianTTSEngine:
     """
     Motore Text-to-Speech (TTS) cloud gratuito in italiano.
@@ -337,6 +437,8 @@ class ItalianTTSEngine:
 
         self.temp_dir = Path(tempfile.gettempdir()) / "venusbot_tts"
         self.temp_dir.mkdir(parents=True, exist_ok=True)
+        # Sintesi in corso per lo stesso testo: chi la richiede di nuovo aspetta quella già avviata
+        self._inflight: Dict[str, "asyncio.Future[Optional[Path]]"] = {}
 
     def set_voice(self, voice_key: str) -> str:
         key = voice_key.strip().lower()
@@ -365,6 +467,30 @@ class ItalianTTSEngine:
             cleaned = cleaned[:647].rsplit(" ", 1)[0] + "."
         return cleaned
 
+    def split_for_speech(self, text: str) -> list[str]:
+        """
+        Divide la risposta in frasi per la sintesi in parallelo: la prima frase resta corta
+        (così inizia a parlare prima) e le successive vengono raggruppate in blocchi più lunghi.
+        """
+        clean = self.clean_text_for_speech(text)
+        if not clean:
+            return []
+        parts = [p.strip() for p in re.split(r"(?<=[.!?;:])\s+", clean) if p.strip()]
+        chunks: list[str] = []
+        for part in parts:
+            if chunks and (
+                len(chunks[-1]) < 12 or (len(chunks) > 1 and len(chunks[-1]) + len(part) < 160)
+            ):
+                chunks[-1] = f"{chunks[-1]} {part}"
+            else:
+                chunks.append(part)
+        return chunks or [clean]
+
+    def prefetch(self, text: str) -> None:
+        """Avvia subito in background la sintesi della risposta (verrà riusata da speakInVC)."""
+        for chunk in self.split_for_speech(text):
+            asyncio.ensure_future(self.synthesize_to_file(chunk))
+
     async def synthesize_to_file(self, text: str) -> Optional[Path]:
         clean_text = self.clean_text_for_speech(text)
         if not clean_text:
@@ -380,6 +506,15 @@ class ItalianTTSEngine:
         if cached_path.exists() and cached_path.stat().st_size > 256:
             return cached_path
 
+        task = self._inflight.get(cache_key)
+        if task is None:
+            task = asyncio.ensure_future(self._synthesize_uncached(clean_text, cached_path))
+            self._inflight[cache_key] = task
+            task.add_done_callback(lambda _t, k=cache_key: self._inflight.pop(k, None))
+        # shield: se chi aspetta viene annullato, la sintesi condivisa continua per gli altri
+        return await asyncio.shield(task)
+
+    async def _synthesize_uncached(self, clean_text: str, cached_path: Path) -> Optional[Path]:
         tmp_path = self.temp_dir / f"tmp_{uuid.uuid4().hex[:10]}.mp3"
 
         if HAS_EDGE_TTS:
@@ -427,15 +562,23 @@ class ItalianTTSEngine:
             pass
         common = (
             "Dimmi pure.",
+            "Dimmi il titolo.",
+            "Ciao! Dimmi pure.",
+            "Sì, ti sento! Dimmi pure.",
             "Musica in pausa.",
             "Riprendo la musica.",
             "Riprendo la riproduzione.",
             "Salto il brano.",
             "Fermo la musica e svuoto la coda.",
             "Ho mescolato la coda di riproduzione.",
+            "Ho svuotato la coda di riproduzione.",
+            "La coda è già vuota.",
             "Rimetto la canzone dall'inizio.",
             "Ripetizione del brano attivata.",
             "Ripetizione disattivata.",
+            "Di nulla!",
+            "A presto!",
+            "Mi dispiace, non ho capito bene.",
         )
         for phrase in common:
             try:
@@ -531,57 +674,142 @@ class ItalianDiscordAudioSource(sr.AudioSource):
         del self.buffer[:]
 
 
+
+
+def _fold_text(text: str) -> str:
+    """Minuscolo, senza accenti e senza punteggiatura: per confrontare trascrizioni."""
+    normalized = unicodedata.normalize("NFD", text.lower())
+    no_accents = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s']", " ", no_accents)).strip()
+
+
+# Frasi che Whisper "inventa" sul silenzio o sul rumore (sottotitoli dei dataset di addestramento)
+_WHISPER_HALLUCINATIONS = {
+    "sottotitoli creati dalla comunita amara org",
+    "sottotitoli e revisione a cura di",
+    "sottotitoli a cura di qtss",
+    "grazie per aver guardato",
+    "grazie per la visione",
+    "thank you for watching",
+    "thanks for watching",
+}
+
+
 class ItalianSpeechSink(voice_recv.AudioSink):
     """
     Sink vocale Discord Multi-Motore ad Alta Precisione (Utterance Collector):
     - Ricostruisce le micro-pause DTX di Discord tra una parola e l'altra (evitando che
       "Venus" e "metti" vengano incollati senza spazio audio).
-    - Normalizza il volume sui PICCHI reali (Peak Normalization a ~73% full-scale)
+    - Normalizza il volume sui PICCHI reali (Peak Normalization a ~70% full-scale)
       senza MAI clippare o distorcere la voce.
-    - Supporta 4 motori Speech-to-Text combinati:
+    - Trascrizione ANTICIPATA: appena l'utente fa una pausa parte già la trascrizione, così quando
+      la pausa diventa "fine frase" il testo è già pronto (centinaia di ms risparmiati a ogni comando).
+    - Supporta 4 motori Speech-to-Text combinati in cascata con "hedging" (se il motore principale
+      è lento parte in parallelo anche il successivo, vince il primo che risponde):
       1. Deepgram Nova-3 (se DEEPGRAM_API_KEY è presente: bilingue nativo IT+EN ultra-preciso)
-      2. Google Gemini 2.0 Flash Audio (se GEMINI_API_KEY è presente: comprensione audio nativa di titoli e artisti)
-      3. Groq Whisper Large v3 (32-layer full model + doppio passaggio IT + EN/Multilingua per le canzoni)
-      4. Google Speech Recognition Multi-Alternativa (top-5 ipotesi it-IT + ipotesi en-US in parallelo)
+      2. Google Gemini Audio (se GEMINI_API_KEY è presente: comprensione audio nativa di titoli e artisti)
+      3. Groq Whisper Large v3 (+ secondo passaggio EN solo per le richieste di canzoni rivolte al bot)
+      4. Google Speech Recognition Multi-Alternativa (top-5 ipotesi it-IT + ipotesi en-US)
     """
 
     SAMPLE_RATE = 48_000
     SAMPLE_WIDTH = 2
-    SHORT_SILENCE_FLUSH_SECONDS = 0.58  # Per attivazione rapida ("Venus")
+    SHORT_SILENCE_FLUSH_SECONDS = 0.62  # Per frasi brevi ("Venus", "Venus, pausa")
     LONG_SILENCE_FLUSH_SECONDS = 0.92   # Per frasi con titolo canzone ("Venus metti ...")
+    SHORT_PHRASE_SECONDS = 0.85         # Sotto questa durata di parlato la frase è considerata breve
+    SPECULATIVE_SILENCE_SECONDS = 0.38  # Dopo questa pausa avvia la trascrizione anticipata
+    MAX_SPECULATIONS_PER_PHRASE = 3
     MAX_PHRASE_SECONDS = 10.0           # Durata massima singola frase
+    ENGINE_HEDGE_SECONDS = 1.2          # Motore lento oltre questa soglia: avvia anche il successivo
+    ENGINE_TIMEOUT_SECONDS = 5.0
     _GROQ_WHISPER_MODELS = ["whisper-large-v3", "whisper-large-v3-turbo"]
+    _GEMINI_STT_MODELS = [
+        "gemini-flash-lite-latest",
+        "gemini-2.5-flash-lite",
+        "gemini-flash-latest",
+        "gemini-2.0-flash",
+    ]
 
     def __init__(
         self,
         on_transcription: Callable[[discord.Member, str], Any],
         phrase_time_limit: int = 12,
         language: str = "it-IT",
+        is_command_candidate: Optional[Callable[[discord.Member, str], bool]] = None,
+        get_wake_words: Optional[Callable[[], List[str]]] = None,
     ):
         self._lock = threading.Lock()
         self._user_buffers: Dict[int, Dict[str, Any]] = {}
         self._preroll_buffers: Dict[int, deque] = defaultdict(lambda: deque(maxlen=15))
         self._executor: Optional[ThreadPoolExecutor] = None
+        self._io_executor: Optional[ThreadPoolExecutor] = None
         self._running = False
         super().__init__(None)
         load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
         self.on_transcription = on_transcription
         self.phrase_time_limit = phrase_time_limit
         self.language = language
+        # Permettono di fare il secondo passaggio EN (più lento) solo per le frasi rivolte al bot
+        # e di suggerire allo STT la parola di attivazione configurata dagli admin.
+        self.is_command_candidate = is_command_candidate
+        self.get_wake_words = get_wake_words
         self.groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip().strip("'\"")
         self.gemini_api_key = (os.getenv("GEMINI_API_KEY") or "").strip().strip("'\"")
         self.deepgram_api_key = (os.getenv("DEEPGRAM_API_KEY") or "").strip().strip("'\"")
+        self.speculative_enabled = (os.getenv("STT_SPECULATIVE") or "1").strip().lower() not in (
+            "0", "false", "no", "off",
+        )
+        self._gemini_models: List[str] = []
+        for model in [(os.getenv("GEMINI_STT_MODEL") or "").strip(), *self._GEMINI_STT_MODELS]:
+            if model and model not in self._gemini_models:
+                self._gemini_models.append(model)
+        self._gemini_no_thinking_cfg: Set[str] = set()
+        # Modelli Whisper di Groq in pausa dopo un errore 429 (limite richieste del piano gratuito)
+        # (chiavi create subito: i thread aggiornano solo i valori, mai la dimensione del dizionario)
+        self._groq_cooldown_until: Dict[str, float] = {m: 0.0 for m in self._GROQ_WHISPER_MODELS}
 
         self._recognizer = sr.Recognizer()
+        # Senza timeout una richiesta a Google bloccata terrebbe occupato un thread per sempre
+        self._recognizer.operation_timeout = 5
+        self._http = self._build_http_session()
+        # Due pool separati: le frasi (che aspettano i motori) e le richieste HTTP ai motori,
+        # così una frase in attesa non può mai bloccare le richieste di cui ha bisogno.
         self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="stt-worker")
+        self._io_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="stt-io")
         self._running = True
         self._flush_thread = threading.Thread(
             target=self._flush_loop, daemon=True, name="italian-speech-flusher"
         )
         self._flush_thread.start()
 
+    @staticmethod
+    def _build_http_session() -> requests.Session:
+        """Sessione HTTP con connessioni keep-alive: niente handshake TLS a ogni frase trascritta."""
+        session = requests.Session()
+        retry = Retry(total=1, connect=1, read=0, status=0, other=0, allowed_methods=None, raise_on_status=False)
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=retry)
+        session.mount("https://", adapter)
+        return session
+
     def wants_opus(self) -> bool:
         return False
+
+    def _wake_words(self) -> List[str]:
+        words: List[str] = []
+        if self.get_wake_words:
+            try:
+                words = [w.strip() for w in self.get_wake_words() if w and w.strip()]
+            except Exception:
+                words = []
+        return words or ["venus", "venere"]
+
+    def _is_command_candidate(self, user: Optional[discord.Member], text: str) -> bool:
+        if self.is_command_candidate is None or user is None:
+            return True
+        try:
+            return bool(self.is_command_candidate(user, text))
+        except Exception:
+            return True
 
     def write(self, user: Optional[discord.Member], data: voice_recv.VoiceData) -> None:
         if not self._running:
@@ -617,6 +845,9 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                     "first_ts": now,
                     "last_ts": now,
                     "last_pkt_ts": now,
+                    "spec_count": 0,
+                    "spec_last_ts": None,
+                    "spec_future": None,
                 }
                 self._user_buffers[user.id] = entry
             else:
@@ -635,38 +866,111 @@ class ItalianSpeechSink(voice_recv.AudioSink):
 
     def _flush_loop(self) -> None:
         while self._running:
-            time.sleep(0.04)
-            now = time.monotonic()
-            to_process = []
+            time.sleep(0.03)
+            try:
+                self._flush_once()
+            except Exception:
+                # Questo thread non deve morire mai: senza di lui il bot smetterebbe di sentire chiunque
+                # (e il watchdog non se ne accorgerebbe, perché l'ascolto risulta ancora attivo)
+                logging.exception("Errore nel ciclo di raccolta frasi vocali")
 
-            with self._lock:
-                for uid, entry in list(self._user_buffers.items()):
-                    silence_elapsed = now - entry["last_ts"]
-                    total_elapsed = now - entry["first_ts"]
-                    threshold = (
-                        self.SHORT_SILENCE_FLUSH_SECONDS
-                        if total_elapsed < 0.85
-                        else self.LONG_SILENCE_FLUSH_SECONDS
-                    )
-                    if (
-                        silence_elapsed >= threshold
-                        or total_elapsed >= self.MAX_PHRASE_SECONDS
-                    ):
-                        self._user_buffers.pop(uid, None)
-                        to_process.append((entry["user"], bytes(entry["pcm"])))
+    def _flush_once(self) -> None:
+        now = time.monotonic()
+        to_finalize = []
+        to_speculate = []
 
-            for user, pcm_bytes in to_process:
-                self._executor.submit(self._process_utterance, user, pcm_bytes)
+        with self._lock:
+            for uid, entry in list(self._user_buffers.items()):
+                silence_elapsed = now - entry["last_ts"]
+                total_elapsed = now - entry["first_ts"]
+                speech_elapsed = entry["last_ts"] - entry["first_ts"]
+                threshold = (
+                    self.SHORT_SILENCE_FLUSH_SECONDS
+                    if speech_elapsed < self.SHORT_PHRASE_SECONDS
+                    else self.LONG_SILENCE_FLUSH_SECONDS
+                )
+                if (
+                    silence_elapsed >= threshold
+                    or total_elapsed >= self.MAX_PHRASE_SECONDS
+                ):
+                    self._user_buffers.pop(uid, None)
+                    to_finalize.append(entry)
+                    if silence_elapsed < threshold:
+                        logging.info(
+                            f"[STT] Frase di {getattr(entry['user'], 'display_name', uid)} interrotta dopo "
+                            f"{self.MAX_PHRASE_SECONDS:.0f}s di audio continuo (rumore di fondo nel microfono?)"
+                        )
+                elif (
+                    self.speculative_enabled
+                    and not self._groq_rate_limited()
+                    and silence_elapsed >= self.SPECULATIVE_SILENCE_SECONDS
+                    and entry["spec_last_ts"] != entry["last_ts"]
+                    and entry["spec_count"] < self.MAX_SPECULATIONS_PER_PHRASE
+                ):
+                    # L'utente si è fermato: trascrivi già adesso. Se riprende a parlare
+                    # il risultato viene scartato, altrimenti è pronto quando la frase si chiude.
+                    if entry["spec_future"] is not None:
+                        entry["spec_future"].cancel()  # la trascrizione anticipata precedente è superata
+                    entry["spec_last_ts"] = entry["last_ts"]
+                    entry["spec_count"] += 1
+                    entry["spec_future"] = None
+                    to_speculate.append((entry, bytes(entry["pcm"]), entry["last_ts"]))
 
-    def _process_utterance(self, user: discord.Member, pcm_bytes: bytes) -> None:
+        for entry, pcm_bytes, spec_ts in to_speculate:
+            # Se in coda l'utente ha ripreso a parlare, salta le chiamate ai motori (risultato inutile)
+            is_stale = partial(lambda e, ts: e["last_ts"] != ts, entry, spec_ts)
+            try:
+                entry["spec_future"] = self._executor.submit(
+                    self._transcribe, entry["user"], pcm_bytes, is_stale
+                )
+            except RuntimeError:
+                pass
+
+        for entry in to_finalize:
+            self._finalize_utterance(entry)
+
+    def _finalize_utterance(self, entry: Dict[str, Any]) -> None:
+        user = entry["user"]
+        spec_future: Optional[Future] = entry.get("spec_future")
+        if spec_future is not None and entry.get("spec_last_ts") == entry["last_ts"]:
+            # Nessuna parola nuova dopo la trascrizione anticipata: il testo è già pronto (o quasi)
+            future = spec_future
+        else:
+            if spec_future is not None:
+                spec_future.cancel()
+            try:
+                future = self._executor.submit(self._transcribe, user, bytes(entry["pcm"]))
+            except RuntimeError:
+                return
+        future.add_done_callback(partial(self._deliver_transcription, user))
+
+    def _deliver_transcription(self, user: discord.Member, future: Future) -> None:
+        if future.cancelled() or not self._running:
+            return
         try:
+            text = future.result()
+        except Exception as e:
+            logging.debug(f"Errore elaborazione frase vocale: {e}")
+            return
+        if text and text.strip():
+            self.on_transcription(user, text.strip())
+
+    def _transcribe(
+        self,
+        user: discord.Member,
+        pcm_bytes: bytes,
+        is_stale: Optional[Callable[[], bool]] = None,
+    ) -> Optional[str]:
+        try:
+            if is_stale is not None and is_stale():
+                return None
             duration_sec = len(pcm_bytes) / (self.SAMPLE_RATE * self.SAMPLE_WIDTH)
             if duration_sec < 0.28:
-                return
+                return None
             rms = audioop.rms(pcm_bytes, self.SAMPLE_WIDTH)
             peak = audioop.max(pcm_bytes, self.SAMPLE_WIDTH)
             if rms < 75 or peak < 350:
-                return
+                return None
 
             # Normalizzazione sul PICCO REALE (Peak Normalization a 23000 / 32767 = ~70% full-scale):
             # amplifica i microfoni bassi ma impedisce MATEMATICAMENTE qualsiasi clipping o distorsione!
@@ -682,11 +986,17 @@ class ItalianSpeechSink(voice_recv.AudioSink):
             framed_pcm = pad + pcm_bytes + pad
 
             audio = sr.AudioData(framed_pcm, self.SAMPLE_RATE, self.SAMPLE_WIDTH)
-            text = self._recognize_italian(self._recognizer, audio)
-            if text and text.strip():
-                self.on_transcription(user, text.strip())
+            text = self._recognize_italian(audio, user)
+            if not text and duration_sec >= 0.6 and (is_stale is None or not is_stale()):
+                # Utile per capire perché a volte "Venus" viene ignorato: c'era audio ma nessun motore l'ha capito
+                logging.info(
+                    f"[STT] Nessuna trascrizione per {duration_sec:.1f}s di audio di "
+                    f"{getattr(user, 'display_name', user)}"
+                )
+            return text
         except Exception as e:
             logging.debug(f"Errore elaborazione frase vocale: {e}")
+            return None
 
     @staticmethod
     def _looks_like_music_request(text: str) -> bool:
@@ -703,105 +1013,165 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                 "play",
                 "cerca",
                 "ascoltiamo",
-                "fammi ascoltare",
-                "voglio ascoltare",
+                "ascoltare",
+                "sentire",
                 "canzone",
                 "brano",
             )
         )
 
-    def _recognize_italian(self, recognizer: sr.Recognizer, audio: sr.AudioData) -> Optional[str]:
+    def _run_engine_cascade(
+        self, engines: List[Tuple[str, Callable[[], Optional[str]]]]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Esegue i motori STT in ordine di priorità con "hedging": se il motore corrente fallisce si passa
+        subito al successivo, se è lento (> ENGINE_HEDGE_SECONDS) il successivo parte in parallelo.
+        Restituisce (nome_motore, testo) del primo motore che produce una trascrizione.
+        """
+        if not engines:
+            return None, None
+        if len(engines) == 1:
+            name, fn = engines[0]
+            try:
+                return name, fn()
+            except Exception as e:
+                logging.debug(f"Motore STT {name} fallito: {e}")
+                return name, None
+
+        pending: Dict[Future, str] = {}
+        next_idx = 0
+        deadline = time.monotonic()
+
+        def launch_next() -> None:
+            nonlocal next_idx, deadline
+            if next_idx < len(engines):
+                name, fn = engines[next_idx]
+                next_idx += 1
+                pending[self._io_executor.submit(fn)] = name
+                deadline = max(deadline, time.monotonic() + self.ENGINE_TIMEOUT_SECONDS)
+
+        launch_next()
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait_for = min(remaining, self.ENGINE_HEDGE_SECONDS) if next_idx < len(engines) else remaining
+            done, _ = wait(list(pending), timeout=wait_for, return_when=FIRST_COMPLETED)
+            if not done:
+                launch_next()
+                continue
+            for fut in done:
+                name = pending.pop(fut)
+                try:
+                    text = fut.result()
+                except Exception as e:
+                    logging.debug(f"Motore STT {name} fallito: {e}")
+                    text = None
+                if text:
+                    return name, text
+                launch_next()
+        return None, None
+
+    def _recognize_italian(self, audio: sr.AudioData, user: Optional[discord.Member] = None) -> Optional[str]:
         wav_bytes: Optional[bytes] = None
         try:
             wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
         except Exception:
             wav_bytes = None
 
-        # 1. Deepgram Nova-3 (se DEEPGRAM_API_KEY è impostata: modello bilingue nativo IT+EN)
+        engines: List[Tuple[str, Callable[[], Optional[str]]]] = []
         if self.deepgram_api_key and wav_bytes:
-            dg_text = self._recognize_with_deepgram(wav_bytes)
-            if dg_text:
-                logging.info(f"[STT: Deepgram Nova-3] '{dg_text}'")
-                return dg_text
-
-        # 2. Google Gemini 2.0 Flash Multimodal Audio (se GEMINI_API_KEY è impostata: ascolto nativo)
+            engines.append(("Deepgram Nova-3", partial(self._recognize_with_deepgram, wav_bytes)))
         if self.gemini_api_key and wav_bytes:
-            gem_text = self._recognize_with_gemini_audio(wav_bytes)
-            if gem_text:
-                logging.info(f"[STT: Gemini Audio] '{gem_text}'")
-                return gem_text
-
-        # 3. Groq Whisper Large v3 (modello completo a 32 layer) + trascrizione parallela EN/Multilingua (0ms extra!)
+            engines.append(("Gemini Audio", partial(self._recognize_with_gemini_audio, wav_bytes)))
         if self.groq_api_key and wav_bytes:
-            en_future = self._executor.submit(self._recognize_google_en, recognizer, audio)
-            whisper_it = self._recognize_with_groq_whisper(wav_bytes, language="it")
-            if whisper_it:
-                if self._looks_like_music_request(whisper_it):
-                    en_hint = None
-                    try:
-                        en_hint = en_future.result(timeout=0.9)
-                    except Exception:
-                        pass
-                    if not en_hint:
-                        en_hint = self._recognize_with_groq_whisper(wav_bytes, language=None)
-                    if en_hint and en_hint.lower().strip() != whisper_it.lower().strip():
-                        logging.info(
-                            f"[STT: Groq Whisper-v3 Dual] IT='{whisper_it}' | EN='{en_hint}'"
-                        )
-                        return f"{whisper_it} [EN_HINT: {en_hint}]"
-                logging.info(f"[STT: Groq Whisper-v3] '{whisper_it}'")
-                return whisper_it
+            engines.append(("Groq Whisper-v3", partial(self._recognize_with_groq_whisper, wav_bytes, "it")))
+        engines.append(("Google", partial(self._recognize_google_multi, audio, user)))
 
-        # 4. Google Speech Recognition Multi-Alternativa (it-IT top-5 + en-US)
+        engine_name, text = self._run_engine_cascade(engines)
+        if not text:
+            return None
+
+        # Groq: secondo passaggio in inglese SOLO per le richieste di canzoni rivolte al bot
+        # (prima partiva una richiesta extra per ogni frase detta nel canale)
+        if (
+            engine_name == "Groq Whisper-v3"
+            and wav_bytes
+            and self._looks_like_music_request(text)
+            and self._is_command_candidate(user, text)
+        ):
+            en_hint = self._recognize_with_groq_whisper(wav_bytes, language="en", timeout=2.0)
+            if en_hint and _fold_text(en_hint) != _fold_text(text):
+                logging.info(f"[STT: Groq Whisper-v3 Dual] IT='{text}' | EN='{en_hint}'")
+                return f"{text} [EN_HINT: {en_hint}]"
+
+        if engine_name != "Google":
+            logging.info(f"[STT: {engine_name}] '{text}'")
+        return text
+
+    def _recognize_google_multi(
+        self, audio: sr.AudioData, user: Optional[discord.Member] = None
+    ) -> Optional[str]:
+        """Google Speech Recognition Multi-Alternativa (it-IT top-5 + en-US per le richieste di canzoni)."""
+        recognizer = self._recognizer
         try:
             func = getattr(recognizer, "recognize_google", None)
-            if func:
-                raw_it = func(audio, language=self.language, show_all=True)
-                best_it = None
-                alt_it: list[str] = []
-                if isinstance(raw_it, dict) and "alternative" in raw_it:
-                    for item in raw_it["alternative"]:
-                        tr = (item.get("transcript") or "").strip()
-                        if tr and tr not in alt_it:
-                            alt_it.append(tr)
-                    if alt_it:
-                        best_it = alt_it[0]
-                elif isinstance(raw_it, str) and raw_it.strip():
-                    best_it = raw_it.strip()
-                    alt_it = [best_it]
+            if not func:
+                return None
+            raw_it = func(audio, language=self.language, show_all=True)
+            best_it = None
+            alt_it: list[str] = []
+            if isinstance(raw_it, dict) and "alternative" in raw_it:
+                for item in raw_it["alternative"]:
+                    tr = (item.get("transcript") or "").strip()
+                    if tr and tr not in alt_it:
+                        alt_it.append(tr)
+                if alt_it:
+                    best_it = alt_it[0]
+            elif isinstance(raw_it, str) and raw_it.strip():
+                best_it = raw_it.strip()
+                alt_it = [best_it]
 
-                if best_it:
-                    # Se nella seconda/terza ipotesi c'è "venus" o "metti" che mancava nella prima, promuovila!
-                    for cand in alt_it[1:]:
-                        cl = cand.lower()
-                        if ("venus" in cl or "venere" in cl) and (
-                            "venus" not in best_it.lower() and "venere" not in best_it.lower()
-                        ):
-                            best_it = cand
-                            break
+            if not best_it:
+                return None
 
-                    extra_hints = []
-                    if len(alt_it) > 1:
-                        others = [a for a in alt_it if a.lower() != best_it.lower()][:3]
-                        if others:
-                            extra_hints.extend(others)
+            # Se nella seconda/terza ipotesi c'è la parola di attivazione che mancava nella prima, promuovila!
+            wake_words = [_fold_text(w) for w in self._wake_words()]
 
-                    if self._looks_like_music_request(best_it) or any(
-                        self._looks_like_music_request(a) for a in alt_it
-                    ):
-                        en_clean = self._recognize_google_en(recognizer, audio)
-                        if en_clean and en_clean.lower() != best_it.lower():
-                            extra_hints.insert(0, en_clean)
+            def has_wake(candidate: str) -> bool:
+                folded = _fold_text(candidate)
+                return any(re.search(rf"\b{re.escape(w)}\b", folded) for w in wake_words if w)
 
-                    if extra_hints:
-                        hint_str = " | ".join(extra_hints)
-                        logging.info(
-                            f"[STT: Google Multi-Hyp] IT='{best_it}' | HINTS='{hint_str}'"
-                        )
-                        return f"{best_it} [EN_HINT: {hint_str}]"
+            if not has_wake(best_it):
+                for cand in alt_it[1:]:
+                    if has_wake(cand):
+                        best_it = cand
+                        break
 
-                    logging.info(f"[STT: Google] '{best_it}'")
-                    return best_it
+            extra_hints = []
+            if len(alt_it) > 1:
+                others = [a for a in alt_it if a.lower() != best_it.lower()][:3]
+                if others:
+                    extra_hints.extend(others)
+
+            hinted = f"{best_it} [EN_HINT: {' | '.join(extra_hints)}]" if extra_hints else best_it
+            if (
+                self._looks_like_music_request(best_it)
+                or any(self._looks_like_music_request(a) for a in alt_it)
+            ) and self._is_command_candidate(user, hinted):
+                en_clean = self._recognize_google_en(recognizer, audio)
+                if en_clean and en_clean.lower() != best_it.lower():
+                    extra_hints.insert(0, en_clean)
+
+            if extra_hints:
+                hint_str = " | ".join(extra_hints)
+                logging.info(
+                    f"[STT: Google Multi-Hyp] IT='{best_it}' | HINTS='{hint_str}'"
+                )
+                return f"{best_it} [EN_HINT: {hint_str}]"
+
+            logging.info(f"[STT: Google] '{best_it}'")
+            return best_it
         except sr.UnknownValueError:
             pass
         except sr.RequestError as e:
@@ -833,7 +1203,7 @@ class ItalianSpeechSink(voice_recv.AudioSink):
 
     def _recognize_with_deepgram(self, wav_bytes: bytes) -> Optional[str]:
         try:
-            resp = requests.post(
+            resp = self._http.post(
                 "https://api.deepgram.com/v1/listen?model=nova-3&language=multi&smart_format=true",
                 headers={
                     "Authorization": f"Token {self.deepgram_api_key}",
@@ -856,102 +1226,168 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         return None
 
     def _recognize_with_gemini_audio(self, wav_bytes: bytes) -> Optional[str]:
-        import base64
-
         b64_audio = base64.b64encode(wav_bytes).decode("ascii")
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-2.0-flash:generateContent?key={self.gemini_api_key}"
+        wake_word = self._wake_words()[0].capitalize()
+        prompt = (
+            "Trascrivi fedelmente questo comando vocale in italiano. "
+            f"La parola di attivazione dell'assistente è '{wake_word}': se la senti scrivila esattamente così. "
+            f"Se l'utente pronuncia il titolo di una canzone o di un artista in inglese o italiano "
+            f"(es. dopo '{wake_word} metti...'), scrivi il titolo e l'artista con lo spelling corretto. "
+            "Restituisci SOLO le parole pronunciate dall'utente, senza commenti né punteggiatura finale."
         )
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "text": (
-                                "Trascrivi fedelmente questo comando vocale in italiano. "
-                                "Se l'utente pronuncia il titolo di una canzone o di un artista in inglese o italiano "
-                                "(es. dopo 'Venus metti...'), scrivi il titolo e l'artista con lo spelling corretto. "
-                                "Restituisci SOLO le parole pronunciate dall'utente, senza commenti né punteggiatura finale."
-                            )
-                        },
-                        {
-                            "inlineData": {
-                                "mimeType": "audio/wav",
-                                "data": b64_audio,
-                            }
-                        },
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.0,
-                "maxOutputTokens": 60,
-            },
-        }
-        try:
-            resp = requests.post(url, json=payload, timeout=3.8)
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    if parts:
-                        text = (parts[0].get("text") or "").strip().strip("\"'`.")
+        for model in list(self._gemini_models):
+            generation_config: Dict[str, Any] = {"temperature": 0.0, "maxOutputTokens": 60}
+            if model not in self._gemini_no_thinking_cfg:
+                # Il "thinking" aggiunge secondi di latenza: per una trascrizione non serve
+                generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt},
+                            {"inlineData": {"mimeType": "audio/wav", "data": b64_audio}},
+                        ]
+                    }
+                ],
+                "generationConfig": generation_config,
+            }
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={self.gemini_api_key}"
+            )
+            try:
+                resp = self._http.post(url, json=payload, timeout=3.8)
+                if resp.status_code == 400 and "thinkingConfig" in generation_config:
+                    self._gemini_no_thinking_cfg.add(model)
+                    generation_config.pop("thinkingConfig", None)
+                    resp = self._http.post(url, json=payload, timeout=3.8)
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        parts = candidates[0].get("content", {}).get("parts", [])
+                        texts = [p.get("text") for p in parts if p.get("text") and not p.get("thought")]
+                        text = "".join(texts).strip().strip("\"'`.")
                         if text and len(text) <= 160:
                             return text
-        except Exception as e:
-            logging.debug(f"Gemini Audio STT fallback: {e}")
+                    return None
+                if resp.status_code == 404 and len(self._gemini_models) > 1:
+                    # Modello dismesso: rimuovilo così le prossime frasi non lo riprovano
+                    try:
+                        self._gemini_models.remove(model)
+                    except ValueError:
+                        pass
+                    continue
+                return None
+            except Exception as e:
+                logging.debug(f"Gemini Audio STT fallback: {e}")
+                return None
         return None
 
+    def _whisper_prompt(self, language: Optional[str]) -> str:
+        names = [w.capitalize() for w in self._wake_words()[:3]]
+        if language == "it":
+            return f"{', '.join(names)}, metti, riproduci, pausa, riprendi, salta, stop, volume."
+        return f"{names[0]}, metti"
+
+    @staticmethod
+    def _is_whisper_hallucination(text: str, segments: Optional[list], prompt: str) -> bool:
+        norm = _fold_text(text)
+        if not norm or norm in _WHISPER_HALLUCINATIONS or norm.startswith("sottotitoli"):
+            return True
+        prompt_norm = _fold_text(prompt)
+        if norm == prompt_norm:
+            return True  # eco del prompt
+
+        prompt_words = set(prompt_norm.split())
+        words = norm.split()
+        only_prompt_words = len(words) <= 2 and all(w in prompt_words for w in words)
+
+        if segments:
+            def _f(seg: dict, key: str, default: float) -> float:
+                try:
+                    return float(seg.get(key, default))
+                except (TypeError, ValueError):
+                    return default
+
+            # Regola standard di Whisper: segmento silenzioso se probabilità di "no speech" alta e confidenza bassa
+            if all(
+                _f(seg, "no_speech_prob", 0.0) > 0.6 and _f(seg, "avg_logprob", 0.0) < -1.0
+                for seg in segments
+            ):
+                return True
+            # "Venus." da solo è valido (l'utente chiama l'assistente e aspetta): scartalo solo se Whisper
+            # indica chiaramente che non c'era voce. Una parola singola ha spesso confidenza bassa,
+            # quindi una soglia troppo severa faceva ignorare proprio la chiamata "Venus".
+            if only_prompt_words:
+                max_no_speech = max(_f(seg, "no_speech_prob", 0.0) for seg in segments)
+                min_logprob = min(_f(seg, "avg_logprob", 0.0) for seg in segments)
+                return max_no_speech > 0.6 or min_logprob < -1.5
+            return False
+
+        # Senza metadati di confidenza mantieni il comportamento prudente
+        return only_prompt_words
+
+    def _groq_rate_limited(self) -> bool:
+        now = time.monotonic()
+        return any(until > now for until in list(self._groq_cooldown_until.values()))
+
+    def _set_groq_cooldown(self, model: str, resp: requests.Response) -> None:
+        try:
+            wait_s = float(resp.headers.get("retry-after") or 20.0)
+        except ValueError:
+            wait_s = 20.0
+        wait_s = max(2.0, min(120.0, wait_s))
+        now = time.monotonic()
+        if self._groq_cooldown_until.get(model, 0.0) <= now:
+            logging.warning(
+                f"[STT] Groq {model}: limite di richieste raggiunto (429), lo salto per {wait_s:.0f}s. "
+                "Con il piano gratuito ogni frase detta nel canale conta come una richiesta."
+            )
+        self._groq_cooldown_until[model] = now + wait_s
+
     def _recognize_with_groq_whisper(
-        self, wav_bytes: bytes, language: Optional[str] = "it"
+        self, wav_bytes: bytes, language: Optional[str] = "it", timeout: float = 3.8
     ) -> Optional[str]:
-        # Prompt minimale non inquinante: evita che Whisper allucini titoli di canzoni non pronunciati!
-        clean_prompt = (
-            "Venus, metti, riproduci, pausa, riprendi, salta, stop, volume."
-            if language == "it"
-            else "Venus, metti"
-        )
+        # Prompt minimale non inquinante (con la parola di attivazione configurata):
+        # evita che Whisper allucini titoli di canzoni non pronunciati!
+        clean_prompt = self._whisper_prompt(language)
 
         for w_model in self._GROQ_WHISPER_MODELS:
+            if self._groq_cooldown_until.get(w_model, 0.0) > time.monotonic():
+                continue  # in pausa per il limite richieste: prova l'altro modello (limite separato)
             try:
                 form_data = {
                     "model": w_model,
                     "prompt": clean_prompt,
-                    "response_format": "json",
+                    "response_format": "verbose_json",
                     "temperature": "0.0",
                 }
                 if language:
                     form_data["language"] = language
 
-                resp = requests.post(
+                resp = self._http.post(
                     "https://api.groq.com/openai/v1/audio/transcriptions",
                     headers={"Authorization": f"Bearer {self.groq_api_key}"},
                     files={"file": ("speech.wav", io.BytesIO(wav_bytes), "audio/wav")},
                     data=form_data,
-                    timeout=3.8,
+                    timeout=timeout,
                 )
                 if resp.status_code == 200:
                     payload = resp.json()
                     text = (payload.get("text") or "").strip()
-                    hallucinations = {
-                        "sottotitoli creati dalla comunità amara.org",
-                        "sottotitoli e revisione a cura di",
-                        "grazie per aver guardato",
-                        "thank you for watching",
-                        "venus, metti, riproduci, pausa, riprendi, salta, stop, volume.",
-                        "venus, metti",
-                        "venus.",
-                        "...",
-                    }
-                    if not text or text.lower().strip() in hallucinations:
+                    if not text or self._is_whisper_hallucination(text, payload.get("segments"), clean_prompt):
                         return None
                     return text
+                elif resp.status_code == 429:
+                    self._set_groq_cooldown(w_model, resp)
+                    continue
                 elif resp.status_code in (401, 403, 404):
                     logging.debug(f"Groq Whisper ({w_model}) HTTP {resp.status_code}: {resp.text[:120]}")
                     continue
                 else:
+                    logging.debug(f"Groq Whisper ({w_model}) HTTP {resp.status_code}: {resp.text[:120]}")
                     break
             except Exception as e:
                 logging.debug(f"Groq Whisper STT ({w_model}) errore: {e}")
@@ -969,8 +1405,14 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         if hasattr(self, "_lock") and hasattr(self, "_user_buffers"):
             with self._lock:
                 self._user_buffers.clear()
+        for pool in (getattr(self, "_executor", None), getattr(self, "_io_executor", None)):
+            try:
+                if pool is not None:
+                    pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
         try:
-            if getattr(self, "_executor", None) is not None:
-                self._executor.shutdown(wait=False, cancel_futures=True)
+            if getattr(self, "_http", None) is not None:
+                self._http.close()
         except Exception:
             pass

@@ -21,6 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 
+# Runtime JavaScript usato da yt-dlp per le challenge di YouTube (il nodejs di Debian è troppo vecchio:
+# yt-dlp richiede node >= 22). Senza, i download da YouTube sono più lenti o falliscono.
+COPY --from=denoland/deno:bin-2.9.6 /deno /usr/local/bin/deno
+
 # Installa prima le dipendenze Python per sfruttare la cache dei layer Docker
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \

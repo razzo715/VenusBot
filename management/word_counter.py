@@ -1,7 +1,12 @@
 import json
+import os
 from pathlib import Path
 import logging
 import aiofiles
+
+# Cache del contenuto del file (riletto solo se cambia): i contatori vengono controllati
+# su ogni frase pronunciata in vocale.
+_FILE_CACHE = {"key": None, "content": None}
 
 
 class WordCounter:
@@ -19,14 +24,26 @@ class WordCounter:
                 encoding="utf-8",
             )
 
+    def _read_cached(self) -> str:
+        try:
+            st = os.stat(self.word_counters_file)
+            file_key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            file_key = None
+        if file_key is not None and _FILE_CACHE["key"] == file_key:
+            return _FILE_CACHE["content"]
+        content = self.word_counters_file.read_text(encoding="utf-8")
+        _FILE_CACHE["key"] = file_key
+        _FILE_CACHE["content"] = content
+        return content
+
     async def loadWordCounters(self):
         try:
-            async with aiofiles.open(self.word_counters_file, "r", encoding="utf-8") as f:
-                content = await f.read()
-                data = json.loads(content) if content.strip() else [{}, {}]
-                if not isinstance(data, list) or len(data) < 2:
-                    return [{}, {}]
-                return data
+            content = self._read_cached()
+            data = json.loads(content) if content.strip() else [{}, {}]
+            if not isinstance(data, list) or len(data) < 2:
+                return [{}, {}]
+            return data
         except Exception as e:
             logging.warning(f"Errore lettura word_counters.json: {e}")
             return [{}, {}]
@@ -34,6 +51,7 @@ class WordCounter:
     async def saveWordCounters(self, data):
         async with aiofiles.open(self.word_counters_file, "w", encoding="utf-8") as f:
             await f.write(json.dumps(data, indent=2, ensure_ascii=False))
+        _FILE_CACHE["key"] = None
 
     async def addKeyword(self, keyword: str, counter_name: str):
         kw = keyword.strip().lower()

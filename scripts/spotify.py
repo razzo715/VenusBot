@@ -15,6 +15,12 @@ class SpotifyController:
         self.__refresh_token = (os.getenv("SPOTIFY_CLIENT_REFRESH_TOKEN") or "").strip().strip("'\"")
         self.__token_url = "https://accounts.spotify.com/api/token"
         self.__access_token: Optional[str] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(keepalive_timeout=60))
+        return self._session
 
     def is_configured(self) -> bool:
         return bool(self.__client_id and self.__client_secret)
@@ -107,55 +113,56 @@ class SpotifyController:
             "limit": "3",
         }
 
-        async with aiohttp.ClientSession() as session:
-            for attempt in range(2):
-                headers = {"Authorization": f"Bearer {access_token}"}
-                try:
-                    async with session.get(
-                        search_url,
-                        headers=headers,
-                        params=params,
-                        timeout=aiohttp.ClientTimeout(total=6),
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            items = data.get("tracks", {}).get("items", [])
-                            if not items:
-                                return None
-                            track = items[0]
-                            title = track.get("name", "")
-                            artists = [a["name"] for a in track.get("artists", []) if a.get("name")]
-                            artist_str = ", ".join(artists[:2]) if artists else ""
-                            primary_artist = artists[0] if artists else ""
-                            images = track.get("album", {}).get("images", [])
-                            thumbnail = images[0]["url"] if images else None
-                            duration_sec = int(round((track.get("duration_ms") or 0) / 1000))
-                            spotify_url = track.get("external_urls", {}).get("spotify")
+        # Sessione HTTP persistente: niente nuovo handshake TLS a ogni brano richiesto a voce
+        session = await self._get_session()
+        for attempt in range(2):
+            headers = {"Authorization": f"Bearer {access_token}"}
+            try:
+                async with session.get(
+                    search_url,
+                    headers=headers,
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=6),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        items = data.get("tracks", {}).get("items", [])
+                        if not items:
+                            return None
+                        track = items[0]
+                        title = track.get("name", "")
+                        artists = [a["name"] for a in track.get("artists", []) if a.get("name")]
+                        artist_str = ", ".join(artists[:2]) if artists else ""
+                        primary_artist = artists[0] if artists else ""
+                        images = track.get("album", {}).get("images", [])
+                        thumbnail = images[0]["url"] if images else None
+                        duration_sec = int(round((track.get("duration_ms") or 0) / 1000))
+                        spotify_url = track.get("external_urls", {}).get("spotify")
 
-                            full_display = f"{artist_str} - {title}" if artist_str else title
-                            search_query = f"{primary_artist} - {title}" if primary_artist else title
+                        full_display = f"{artist_str} - {title}" if artist_str else title
+                        search_query = f"{primary_artist} - {title}" if primary_artist else title
 
-                            logging.info(
-                                f"[Catalogo Spotify] Trovato brano ufficiale: '{full_display}' ({duration_sec}s)"
-                            )
-                            return {
-                                "title": title,
-                                "artist": primary_artist,
-                                "full_title": full_display,
-                                "search_query": search_query,
-                                "thumbnail": thumbnail,
-                                "duration": duration_sec,
-                                "spotify_url": spotify_url,
-                            }
-                        elif resp.status == 401 and attempt == 0:
-                            access_token = await self.refresh_token()
-                            if not access_token:
-                                break
-                        else:
+                        logging.info(
+                            f"[Catalogo Spotify] Trovato brano ufficiale: '{full_display}' ({duration_sec}s)"
+                        )
+                        return {
+                            "title": title,
+                            "artist": primary_artist,
+                            "full_title": full_display,
+                            "search_query": search_query,
+                            "thumbnail": thumbnail,
+                            "duration": duration_sec,
+                            "spotify_url": spotify_url,
+                        }
+                    elif resp.status == 401 and attempt == 0:
+                        access_token = await self.refresh_token()
+                        if not access_token:
                             break
-                except Exception as e:
-                    logging.debug(f"Errore ricerca catalogo Spotify: {e}")
-                    break
+                    else:
+                        break
+            except Exception as e:
+                logging.debug(f"Errore ricerca catalogo Spotify: {e}")
+                break
 
         return None
 

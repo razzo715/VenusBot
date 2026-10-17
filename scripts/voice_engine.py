@@ -881,14 +881,20 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                     ):
                         # L'utente si è fermato: trascrivi già adesso. Se riprende a parlare
                         # il risultato viene scartato, altrimenti è pronto quando la frase si chiude.
+                        if entry["spec_future"] is not None:
+                            entry["spec_future"].cancel()  # la trascrizione anticipata precedente è superata
                         entry["spec_last_ts"] = entry["last_ts"]
                         entry["spec_count"] += 1
                         entry["spec_future"] = None
-                        to_speculate.append((entry, bytes(entry["pcm"])))
+                        to_speculate.append((entry, bytes(entry["pcm"]), entry["last_ts"]))
 
-            for entry, pcm_bytes in to_speculate:
+            for entry, pcm_bytes, spec_ts in to_speculate:
+                # Se in coda l'utente ha ripreso a parlare, salta le chiamate ai motori (risultato inutile)
+                is_stale = partial(lambda e, ts: e["last_ts"] != ts, entry, spec_ts)
                 try:
-                    entry["spec_future"] = self._executor.submit(self._transcribe, entry["user"], pcm_bytes)
+                    entry["spec_future"] = self._executor.submit(
+                        self._transcribe, entry["user"], pcm_bytes, is_stale
+                    )
                 except RuntimeError:
                     pass
 
@@ -921,8 +927,15 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         if text and text.strip():
             self.on_transcription(user, text.strip())
 
-    def _transcribe(self, user: discord.Member, pcm_bytes: bytes) -> Optional[str]:
+    def _transcribe(
+        self,
+        user: discord.Member,
+        pcm_bytes: bytes,
+        is_stale: Optional[Callable[[], bool]] = None,
+    ) -> Optional[str]:
         try:
+            if is_stale is not None and is_stale():
+                return None
             duration_sec = len(pcm_bytes) / (self.SAMPLE_RATE * self.SAMPLE_WIDTH)
             if duration_sec < 0.28:
                 return None

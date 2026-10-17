@@ -77,8 +77,6 @@ ITALIAN_GREETING_PREFIXES = {
     "allora",
     "bella",
     "ehila",
-    "dai",
-    "ecco",
 }
 _PREFIXES_PATTERN = "|".join(sorted(map(re.escape, ITALIAN_GREETING_PREFIXES), key=len, reverse=True))
 
@@ -374,8 +372,14 @@ class BotKeywords:
                 spans = []
                 if s_idx + num_words <= len(tokens):
                     spans.append((tokens[s_idx : s_idx + num_words], " "))
-                # Wake word spezzata in due dal riconoscitore ("ve nus", "vi nus")
-                if num_words == 1 and s_idx + 2 <= len(tokens) and len(norm_kw) >= 5:
+                # Wake word spezzata in due dal riconoscitore ("ve nus", "vi nus"): solo se le due parole
+                # unite sono lunghe almeno quanto la wake word (altrimenti "ve ne" somiglierebbe a "venere")
+                if (
+                    num_words == 1
+                    and s_idx + 2 <= len(tokens)
+                    and len(norm_kw) >= 5
+                    and len(tokens[s_idx].group(0)) + len(tokens[s_idx + 1].group(0)) >= len(norm_kw)
+                ):
                     spans.append((tokens[s_idx : s_idx + 2], ""))
 
                 for span_tokens, joiner in spans:

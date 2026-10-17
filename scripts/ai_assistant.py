@@ -180,19 +180,28 @@ _TRAILING_FILLERS_RE = re.compile(
     r"\s+(?:per\s+(?:favore|piacere|cortesia)|perfavore|grazie(?:\s+(?:mille|tante))?"
     r"|adesso|ora|subito|dai|ok|okay|please|su\s+youtube|su\s+spotify)$"
 )
+# Nei titoli delle canzoni si tolgono solo le cortesie inequivocabili ("Please Please Please", "Dai dai dai"
+# e "Ok Computer" sono titoli veri)
+_TRAILING_POLITENESS_RE = re.compile(
+    r"\s+(?:per\s+(?:favore|piacere|cortesia)|perfavore|grazie(?:\s+(?:mille|tante))?"
+    r"|adesso|ora|subito|su\s+youtube|su\s+spotify)$"
+)
 _ONLY_FILLERS_RE = re.compile(rf"(?:{_FILLER_WORDS})(?:\s+(?:{_FILLER_WORDS}))*")
 
 
-def strip_fillers(text: str) -> str:
+def strip_fillers(
+    text: str, *, leading: bool = True, trailing: bool = True, title_mode: bool = False
+) -> str:
     """Toglie intercalari iniziali ("allora", "senti", "puoi") e cortesie finali ("per favore", "grazie")."""
     folded = fold_text(text)
     start, end = 0, len(text)
-    for _ in range(3):
-        m = _TRAILING_FILLERS_RE.search(folded, 0, end)
+    trailing_re = _TRAILING_POLITENESS_RE if title_mode else _TRAILING_FILLERS_RE
+    for _ in range(3 if trailing else 0):
+        m = trailing_re.search(folded, 0, end)
         if not m:
             break
         end = m.start()
-    for _ in range(4):
+    for _ in range(4 if leading else 0):
         m = _LEADING_FILLERS_RE.match(folded, start, end)
         if not m:
             break
@@ -348,6 +357,11 @@ _CHAT_REPLIES: List[Tuple[str, "re.Pattern[str]", str]] = [
 ]
 
 _PLAY_VERB_RE = re.compile(rf"(?:{_PLAY_VERBS})\s+")
+_GENERIC_MUSIC_OBJ_RE = re.compile(rf"(?:(?:una|un|qualche)\s+{_TRACK}|(?:un\s+po'?\s+di\s+|della\s+)?musica)")
+# Nella finestra "Dimmi il titolo." solo queste frasi sono comandi: tutto il resto è un titolo
+# (anche "Fermati", "Passa" o "Casuale" possono essere canzoni)
+_SONG_MODE_CANCEL = r"(?:niente|nulla|lascia\s+(?:stare|perdere)|annulla|non\s+importa|non\s+fa\s+niente|ho\s+sbagliato|no|stop|basta)"
+_SONG_MODE_CANCEL_RE = re.compile(rf"{_SONG_MODE_CANCEL}(?:\s+{_SONG_MODE_CANCEL})*")
 _PLAY_OBJECT_PREFIX_RE = re.compile(
     r"(?:(?:la\s+canzone|il\s+brano|il\s+pezzo|le\s+canzoni)(?:\s+(?:di|dei|degli|delle|del|della))?"
     r"|(?:un\s+brano|una\s+canzone|un\s+pezzo|qualcosa|un\s+po'?)\s+(?:di|dei|degli|delle|del|della|dello)"
@@ -438,6 +452,8 @@ class AIAssistant:
 
         for action, pattern, reply in _FAST_COMMANDS:
             if pattern.fullmatch(lower):
+                if action == "listen_song_followup" and self._extract_Explicit_play_query(text):
+                    continue  # "metti Please Please Please": il titolo c'è, non chiedere "Dimmi il titolo."
                 return AssistantResponse(action=action, voice_reply=reply)
 
         m_vol = _VOLUME_SET_RE.fullmatch(lower)
@@ -487,15 +503,18 @@ class AIAssistant:
     @staticmethod
     def _extract_Explicit_play_query(text: str) -> Optional[str]:
         """Estrae la canzone/artista da 'metti/riproduci/suona/play ...' preservando le maiuscole."""
-        clean = strip_fillers(clean_spoken_text(text))
+        clean = strip_fillers(clean_spoken_text(text), trailing=False)
         m_play = _PLAY_VERB_RE.match(fold_text(clean))
         if not m_play:
             return None
         q = clean[m_play.end():].strip()
+        q = strip_fillers(q, leading=False, title_mode=True) or q
         m_obj = _PLAY_OBJECT_PREFIX_RE.match(fold_text(q))
         if m_obj and m_obj.end() < len(q):
             q = q[m_obj.end():].strip()
-        return q or None
+        if not q or _GENERIC_MUSIC_OBJ_RE.fullmatch(fold_text(q)):
+            return None  # "metti una canzone": manca il titolo
+        return q
 
     def _cache_song(self, key: str, value: str) -> None:
         self._song_cache[key] = value
@@ -852,16 +871,25 @@ class AIAssistant:
     ) -> AssistantResponse:
         it_text, en_hint = split_en_hint(user_text)
 
-        # 1. Prova sempre prima i comandi di controllo LOCALI ISTANTANEI (< 1ms, zero LLM!)
-        fast = self._match_fast_command(it_text)
-        if fast is not None:
-            return fast
+        if force_song_mode:
+            # Finestra dopo "Venus, metti..." / "Dimmi il titolo.": quello che dice l'utente è il titolo,
+            # tranne un annullamento esplicito ("niente", "lascia stare")
+            lower = _normalize_command_text(it_text)
+            if lower and _SONG_MODE_CANCEL_RE.fullmatch(lower):
+                return AssistantResponse(action="none", voice_reply="")
+            if not lower or _ONLY_FILLERS_RE.fullmatch(lower):
+                return AssistantResponse(action="listen_song_followup", voice_reply="Dimmi il titolo.")
+            raw_song_query = self._extract_Explicit_play_query(it_text) or strip_fillers(
+                clean_spoken_text(it_text), leading=False, title_mode=True
+            ) or None
+        else:
+            # 1. Prova sempre prima i comandi di controllo LOCALI ISTANTANEI (< 1ms, zero LLM!)
+            fast = self._match_fast_command(it_text)
+            if fast is not None:
+                return fast
 
-        # 2. Se l'utente è nella finestra dopo "Venus, metti..." (force_song_mode)
-        # oppure ha pronunciato "metti / riproduci / suona <canzone>", usa il risolutore rapido canzoni!
-        raw_song_query = self._extract_Explicit_play_query(it_text)
-        if not raw_song_query and force_song_mode:
-            raw_song_query = strip_fillers(clean_spoken_text(it_text)) or None
+            # 2. Se l'utente ha pronunciato "metti / riproduci / suona <canzone>", usa il risolutore rapido canzoni!
+            raw_song_query = self._extract_Explicit_play_query(it_text)
 
         if raw_song_query:
             resolved_song = await self.resolve_song_query(raw_song_query, en_hint=en_hint)

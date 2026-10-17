@@ -2,6 +2,7 @@
 Test della comprensione dei comandi vocali (nessuna chiamata di rete).
 Esegui con:  python -m unittest discover -s tests
 """
+import asyncio
 import os
 import sys
 import unittest
@@ -73,6 +74,33 @@ class TestComandiLocali(unittest.TestCase):
         self.assertEqual(extract("Fammi sentire qualcosa dei Queen"), "Queen")
         self.assertEqual(extract("Riproduci un po' di musica rock"), "musica rock")
         self.assertIsNone(extract("Cerca su Google chi è il presidente"))
+        self.assertIsNone(extract("Metti una canzone, per favore."))
+        # Titoli che contengono parole di cortesia/intercalari
+        self.assertEqual(extract("metti Please Please Please"), "Please Please Please")
+        self.assertEqual(extract("metti Dai dai dai"), "Dai dai dai")
+        self.assertEqual(extract("Metti Ora"), "Ora")
+        self.assertEqual(extract("metti Vasco Rossi, per favore"), "Vasco Rossi")
+
+
+class TestFinestraTitolo(unittest.TestCase):
+    """Dopo "Dimmi il titolo." quello che dice l'utente è un titolo, salvo annullamento esplicito."""
+
+    def setUp(self):
+        self.assistant = AIAssistant()
+        self.assistant.groq_api_key = self.assistant.gemini_api_key = ""
+
+    def song_mode(self, text):
+        return asyncio.run(self.assistant.process_request(1, "test", text, force_song_mode=True))
+
+    def test_titoli_non_diventano_comandi(self):
+        for title in ("Fermati", "Passa", "Vattene", "Casuale", "Un attimo"):
+            resp = self.song_mode(title)
+            self.assertEqual((resp.action, resp.query), ("play", title), title)
+        self.assertEqual(self.song_mode("Ok Computer").query, "Ok Computer")
+
+    def test_annullamento(self):
+        for text in ("Niente, lascia stare.", "No", "Stop"):
+            self.assertEqual(self.song_mode(text).action, "none", text)
 
 
 class TestParolaDiAttivazione(unittest.TestCase):
@@ -91,7 +119,10 @@ class TestParolaDiAttivazione(unittest.TestCase):
         self.assertTrue(self.extract("Ciao Venere, che ore sono?")[0])
 
     def test_nessuna_attivazione(self):
-        for text in ("ieri sera ho mangiato una pizza", "venerdì andiamo al mare", "menu del giorno", "Venusiano"):
+        for text in (
+            "ieri sera ho mangiato una pizza", "venerdì andiamo al mare", "menu del giorno", "Venusiano",
+            "Ve ne siete accorti?", "Ve ne parlo dopo.", "Ecco, venne fuori tutto", "Dai, vene fuori",
+        ):
             self.assertFalse(self.extract(text)[0], text)
 
     def test_ipotesi_alternative(self):

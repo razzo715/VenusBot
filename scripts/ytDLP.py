@@ -123,6 +123,7 @@ class VideoSearcher:
         self.cookies_path = root_dir / "cookies.txt"
         self.cache_dir = Path(tempfile.gettempdir()) / "venusbot_music"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.ytdlp_cache_dir = Path(tempfile.gettempdir()) / "venusbot_ytdlp_cache"
 
     def _get_base_options(self) -> dict:
         """
@@ -130,12 +131,16 @@ class VideoSearcher:
         - Usa i client predefiniti di yt-dlp 2026 ('tv', 'android_sdkless', 'web')
           evitando 'android_vr' e 'ios' che causano HTTP Error 403 Forbidden.
         - Forza IPv4 ('source_address': '0.0.0.0') per evitare Read Timeout su Docker.
+        - Cache su disco del player YouTube già elaborato: senza, ogni brano riscaricava e
+          rielaborava il player JavaScript (secondi di attesa in più a ogni richiesta).
+        - Abilita deno e node (>= 22) per risolvere le challenge JavaScript di YouTube (yt-dlp-ejs).
         """
         opts = {
             "format": "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best",
             "quiet": True,
             "no_warnings": True,
-            "cachedir": False,
+            "cachedir": str(self.ytdlp_cache_dir),
+            "js_runtimes": {"deno": {}, "node": {}},
             "nocheckcertificate": True,
             "geo_bypass": True,
             "source_address": "0.0.0.0",

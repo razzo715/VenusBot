@@ -1,7 +1,9 @@
 import difflib
 import json
 import logging
+import os
 import re
+import threading
 import unicodedata
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -12,6 +14,16 @@ def _strip_accents(text: str) -> str:
     """Rimuove gli accenti mantenendo le lettere base (es. 'è' -> 'e')."""
     normalized = unicodedata.normalize("NFD", text)
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+
+
+def _fold(text: str) -> str:
+    """Minuscolo e senza accenti, mantenendo la stessa lunghezza del testo originale."""
+    out = []
+    for ch in text:
+        base = unicodedata.normalize("NFD", ch)[0]
+        low = base.lower()
+        out.append(low if len(low) == 1 else base)
+    return "".join(out)
 
 
 def _italian_phonetic_key(word: str) -> str:
@@ -64,7 +76,33 @@ ITALIAN_GREETING_PREFIXES = {
     "ascolta",
     "allora",
     "bella",
+    "ehila",
+    "dai",
+    "ecco",
 }
+_PREFIXES_PATTERN = "|".join(sorted(map(re.escape, ITALIAN_GREETING_PREFIXES), key=len, reverse=True))
+
+# Grafie con cui i motori STT italiani/inglesi trascrivono spesso la wake word predefinita
+WAKE_WORD_VARIANTS = {
+    "venus": ("venere", "vinus", "venos", "benus", "fenus", "menus", "venous", "venuss", "wenus", "venuz"),
+}
+
+# Inizi di comando: permettono di separare la wake word "incollata" al comando ("Venusmetti in pausa")
+_GLUED_COMMAND_START = (
+    r"(?:metti|mettere|riproduci|suona|pausa|salta|skip|stop|ferma|riprendi|alza|abbassa|volume|basta"
+    r"|avanti|prossima|ripeti|mescola|esci|cerca|play|che|chi|come|quanto|dimmi|raccontami)"
+)
+
+DEFAULT_KEYWORDS_CONFIG = {
+    "primary": "venus",
+    "aliases": ["venere"],
+    "fuzzy_threshold": 0.78,
+}
+
+# Cache in memoria condivisa (invalidata quando il file cambia): la wake word viene controllata
+# su OGNI frase pronunciata in vocale, quindi evitiamo di rileggere il JSON dal disco ogni volta.
+_CONFIG_LOCK = threading.Lock()
+_CONFIG_CACHE: Dict[str, object] = {"key": None, "config": None}
 
 
 class BotKeywords:
@@ -80,13 +118,8 @@ class BotKeywords:
         root_dir = Path(__file__).resolve().parent
         self.bot_keywords_file = root_dir / "bot_keywords.json"
         if not self.bot_keywords_file.exists():
-            default_data = {
-                "primary": "venus",
-                "aliases": ["venere"],
-                "fuzzy_threshold": 0.78,
-            }
             self.bot_keywords_file.write_text(
-                json.dumps(default_data, indent=2, ensure_ascii=False),
+                json.dumps(DEFAULT_KEYWORDS_CONFIG, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
 
@@ -121,21 +154,46 @@ class BotKeywords:
             "fuzzy_threshold": 0.78,
         }
 
-    async def loadConfig(self) -> Dict:
+    @staticmethod
+    def _copy_config(config: Dict) -> Dict:
+        return {**config, "aliases": list(config["aliases"])}
+
+    def load_config_sync(self) -> Dict:
+        """Legge la configurazione dalla cache in memoria (riletta dal disco solo se il file è cambiato)."""
         try:
-            async with aiofiles.open(self.bot_keywords_file, "r", encoding="utf-8") as f:
-                content = await f.read()
-                raw = json.loads(content) if content.strip() else {}
+            st = os.stat(self.bot_keywords_file)
+            file_key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            file_key = None
+
+        with _CONFIG_LOCK:
+            cached = _CONFIG_CACHE["config"]
+            if file_key is not None and cached is not None and _CONFIG_CACHE["key"] == file_key:
+                return self._copy_config(cached)
+
+        try:
+            content = self.bot_keywords_file.read_text(encoding="utf-8")
+            raw = json.loads(content) if content.strip() else {}
         except Exception as e:
             logging.warning(f"Errore lettura bot_keywords.json, ripristino default: {e}")
             raw = {}
         config = self._normalize_schema(raw)
+
+        with _CONFIG_LOCK:
+            _CONFIG_CACHE["key"] = file_key
+            _CONFIG_CACHE["config"] = self._copy_config(config)
         return config
+
+    async def loadConfig(self) -> Dict:
+        return self.load_config_sync()
 
     async def saveConfig(self, config: Dict):
         normalized = self._normalize_schema(config)
         async with aiofiles.open(self.bot_keywords_file, "w", encoding="utf-8") as f:
             await f.write(json.dumps(normalized, indent=2, ensure_ascii=False))
+        with _CONFIG_LOCK:
+            _CONFIG_CACHE["key"] = None
+            _CONFIG_CACHE["config"] = None
 
     async def getPrimaryKeyword(self) -> str:
         config = await self.loadConfig()
@@ -210,14 +268,34 @@ class BotKeywords:
         await self.saveConfig(config)
         return config
 
-    async def extractCommandAfterWakeWord(self, text: str) -> Tuple[bool, Optional[str], str]:
+    def get_wake_words_sync(self) -> List[str]:
+        """Parole di attivazione configurate (principale + alias), usate anche come suggerimento per lo STT."""
+        config = self.load_config_sync()
+        return [config["primary"]] + config["aliases"]
+
+    @staticmethod
+    def _keywords_with_variants(config: Dict) -> List[str]:
+        keywords = [config["primary"]] + config["aliases"]
+        for kw in list(keywords):
+            for variant in WAKE_WORD_VARIANTS.get(kw, ()):
+                if variant not in keywords:
+                    keywords.append(variant)
+        return sorted(keywords, key=len, reverse=True)
+
+    def contains_wake_word_sync(self, text: str) -> bool:
+        return self.extract_command_sync(text)[0]
+
+    def extract_command_sync(
+        self, text: str, config: Optional[Dict] = None
+    ) -> Tuple[bool, Optional[str], str]:
         """
         Analizza il testo trascritto in italiano per verificare se contiene la parola di attivazione.
         Supporta:
         - Punteggiatura dopo la wake word (es. "Venus, che ore sono?")
         - Prefissi colloquiali ("Ehi Venus...", "Ok Venus...", "Ciao Venus...")
         - Wake word multi-parola (es. "ok google", "ehi assistente")
-        - Tolleranza fonetica e fuzzy matching sulle prime parole della frase
+        - Wake word incollata al comando ("Venusmetti in pausa") o spezzata in due ("Ve nus")
+        - Accenti e maiuscole indifferenti, tolleranza fonetica e fuzzy matching sulle prime parole
 
         Restituisce:
             (attivato: bool, wake_word_rilevata: Optional[str], comando_residuo: str)
@@ -232,98 +310,120 @@ class BotKeywords:
         if m_hint:
             en_hint_suffix = m_hint.group(1)
             en_hint_content = m_hint.group(2).strip()
-            cleaned_text = text[: m_hint.start()].strip()
+            cleaned_text = text.strip()[: m_hint.start()].strip()
         else:
             cleaned_text = text.strip()
 
-        config = await self.loadConfig()
-        keywords = [config["primary"]] + config["aliases"]
-        # Aggiungi varianti fonetiche tipiche di "venus" nei motori STT italiani/inglesi
-        if "venus" in keywords:
-            for v_alias in ("venere", "vinus", "venos", "benus", "fenus", "menus"):
-                if v_alias not in keywords:
-                    keywords.append(v_alias)
+        cleaned_text = unicodedata.normalize("NFC", cleaned_text).replace("’", "'")
+        folded = _fold(cleaned_text)
+
+        if config is None:
+            config = self.load_config_sync()
+        sorted_keywords = self._keywords_with_variants(config)
         threshold = config.get("fuzzy_threshold", 0.75)
 
-        # 1. Controllo regex diretto (esatto o senza accenti) ovunque nella frase iniziale
-        sorted_keywords = sorted(keywords, key=len, reverse=True)
+        def _activated(kw: str, end_pos: int) -> Tuple[bool, Optional[str], str]:
+            remainder = re.sub(r"^[\s,.:;!?\-]+", "", cleaned_text[end_pos:]).strip()
+            return True, kw, f"{remainder}{en_hint_suffix}".strip() if remainder else ""
+
+        # 1. Controllo regex diretto (senza accenti/maiuscole) all'inizio o nelle primissime parole
         for kw in sorted_keywords:
-            pattern = rf"^(?:(?:{'|'.join(ITALIAN_GREETING_PREFIXES)})[\s,.:;!?]+)*({re.escape(kw)})\b[\s,.:;!?]*(.*)$"
-            m = re.match(pattern, cleaned_text, flags=re.IGNORECASE)
+            fkw = re.escape(_fold(kw))
+            m = re.match(rf"(?:(?:{_PREFIXES_PATTERN})[\s,.:;!?]+)*({fkw})\b", folded)
             if m:
-                rem = m.group(2).strip()
-                return True, kw, f"{rem}{en_hint_suffix}".strip() if rem else ""
+                return _activated(kw, m.end(1))
 
             # Controllo anche se la wake word è preceduta da massimo 1-2 parole nella frase
-            pattern_anywhere = rf"\b({re.escape(kw)})\b[\s,.:;!?]*(.*)$"
-            m2 = re.search(pattern_anywhere, cleaned_text, flags=re.IGNORECASE)
+            m2 = re.search(rf"\b({fkw})\b", folded)
             if m2 and m2.start() <= 24:
-                rem = m2.group(2).strip()
-                return True, kw, f"{rem}{en_hint_suffix}".strip() if rem else ""
+                return _activated(kw, m2.end(1))
 
-        # 2. Controllo fonetico e fuzzy sulle prime parole della frase
-        tokens = list(re.finditer(r"[\wàèéìòùÀÈÉÌÒÙ]+", cleaned_text))
+        # 2. Wake word incollata al comando dal riconoscitore vocale ("venusmetti in pausa")
+        for kw in sorted_keywords:
+            fkw = re.escape(_fold(kw))
+            m = re.match(
+                rf"(?:(?:{_PREFIXES_PATTERN})[\s,.:;!?]+)*({fkw})(?={_GLUED_COMMAND_START})", folded
+            )
+            if m:
+                return _activated(kw, m.end(1))
+
+        # 3. Controllo fonetico e fuzzy sulle prime parole della frase
+        tokens = list(re.finditer(r"\w+", folded))
         if not tokens:
             return False, None, ""
 
         start_idx = 0
         while (
             start_idx < len(tokens) - 1
-            and _strip_accents(tokens[start_idx].group(0).lower()) in ITALIAN_GREETING_PREFIXES
+            and tokens[start_idx].group(0) in ITALIAN_GREETING_PREFIXES
         ):
             start_idx += 1
 
         candidate_starts = [start_idx] if start_idx == 0 else [0, start_idx]
+        # Il fuzzy usa solo le parole configurate: le varianti ortografiche valgono solo se esatte
+        # (altrimenti "menu del giorno" somiglierebbe alla variante "menus")
+        configured_keywords = sorted([config["primary"]] + config["aliases"], key=len, reverse=True)
 
         for s_idx in candidate_starts:
-            for kw in sorted_keywords:
+            for kw in configured_keywords:
                 kw_words = kw.split()
                 num_words = len(kw_words)
-                if s_idx + num_words > len(tokens):
-                    continue
-
-                span_tokens = tokens[s_idx : s_idx + num_words]
-                spoken_phrase = " ".join(t.group(0).lower() for t in span_tokens)
-
-                norm_spoken = _strip_accents(spoken_phrase)
-                norm_kw = _strip_accents(kw)
-                ratio_direct = difflib.SequenceMatcher(None, norm_spoken, norm_kw).ratio()
-
-                phon_spoken = " ".join(_italian_phonetic_key(t.group(0)) for t in span_tokens)
-                phon_kw = " ".join(_italian_phonetic_key(w) for w in kw_words)
-                ratio_phonetic = (
-                    difflib.SequenceMatcher(None, phon_spoken, phon_kw).ratio()
-                    if phon_spoken and phon_kw
-                    else 0.0
-                )
-
-                best_ratio = max(ratio_direct, ratio_phonetic)
+                norm_kw = _fold(kw)
                 effective_threshold = max(threshold, 0.88) if len(norm_kw) <= 3 else threshold
 
-                if best_ratio >= effective_threshold:
-                    end_char_pos = span_tokens[-1].end()
-                    remainder = cleaned_text[end_char_pos:]
-                    remainder = re.sub(r"^[\s,.:;!?-]+", "", remainder).strip()
-                    logging.debug(
-                        f"Wake word '{kw}' rilevata tramite match fonetico/fuzzy "
-                        f"('{spoken_phrase}', score={best_ratio:.2f})"
-                    )
-                    return True, kw, f"{remainder}{en_hint_suffix}".strip() if remainder else ""
+                spans = []
+                if s_idx + num_words <= len(tokens):
+                    spans.append((tokens[s_idx : s_idx + num_words], " "))
+                # Wake word spezzata in due dal riconoscitore ("ve nus", "vi nus")
+                if num_words == 1 and s_idx + 2 <= len(tokens) and len(norm_kw) >= 5:
+                    spans.append((tokens[s_idx : s_idx + 2], ""))
 
-        # 3. Se la prima ipotesi non conteneva la wake word ma una delle ipotesi alternative in EN_HINT sì, usala!
+                for span_tokens, joiner in spans:
+                    spoken_phrase = joiner.join(t.group(0) for t in span_tokens)
+                    ratio_direct = difflib.SequenceMatcher(None, spoken_phrase, norm_kw).ratio()
+
+                    phon_spoken = joiner.join(_italian_phonetic_key(t.group(0)) for t in span_tokens)
+                    phon_kw = " ".join(_italian_phonetic_key(w) for w in kw_words)
+                    ratio_phonetic = (
+                        difflib.SequenceMatcher(None, phon_spoken, phon_kw).ratio()
+                        if phon_spoken and phon_kw
+                        else 0.0
+                    )
+
+                    best_ratio = max(ratio_direct, ratio_phonetic)
+                    if best_ratio >= effective_threshold:
+                        logging.debug(
+                            f"Wake word '{kw}' rilevata tramite match fonetico/fuzzy "
+                            f"('{spoken_phrase}', score={best_ratio:.2f})"
+                        )
+                        return _activated(kw, span_tokens[-1].end())
+
+        # 4. Se la prima ipotesi non conteneva la wake word ma una delle ipotesi alternative in EN_HINT sì, usala!
+        # Tra più alternative valide scegli quella più simile alla trascrizione principale italiana
+        # (l'ipotesi en-US serve per i titoli, ma il comando italiano va preso dall'ipotesi italiana).
         if en_hint_content:
+            best_alt: Optional[Tuple[float, str, str]] = None
             for alt_candidate in en_hint_content.split("|"):
-                alt_c = alt_candidate.strip()
+                alt_raw = alt_candidate.strip()
+                alt_c = _fold(alt_raw)
                 if not alt_c:
                     continue
                 for kw in sorted_keywords:
                     m_alt = re.match(
-                        rf"^(?:(?:{'|'.join(ITALIAN_GREETING_PREFIXES)})[\s,.:;!?]+)*({re.escape(kw)})\b[\s,.:;!?]*(.*)$",
+                        rf"(?:(?:{_PREFIXES_PATTERN})[\s,.:;!?]+)*({re.escape(_fold(kw))})\b[\s,.:;!?]*(.*)$",
                         alt_c,
-                        flags=re.IGNORECASE,
                     )
                     if m_alt:
-                        rem = m_alt.group(2).strip()
-                        return True, kw, f"{rem}{en_hint_suffix}".strip() if rem else ""
+                        rem = alt_raw[m_alt.start(2):].strip()
+                        score = difflib.SequenceMatcher(None, _fold(rem), folded).ratio()
+                        if best_alt is None or score > best_alt[0]:
+                            best_alt = (score, kw, rem)
+                        break
+            if best_alt is not None:
+                _, kw, rem = best_alt
+                return True, kw, f"{rem}{en_hint_suffix}".strip() if rem else ""
 
         return False, None, ""
+
+    async def extractCommandAfterWakeWord(self, text: str) -> Tuple[bool, Optional[str], str]:
+        return self.extract_command_sync(text)

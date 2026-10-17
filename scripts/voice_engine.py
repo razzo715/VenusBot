@@ -110,6 +110,14 @@ def patch_voice_recv_for_dave() -> None:
         if hasattr(self, "_dave_bad"):
             self._dave_bad.clear()
 
+    def _count_dave_drop(self, reason: str) -> None:
+        # Pacchetti vocali scartati prima dello STT: se succede spesso il bot "non sente" chi parla
+        self._dave_drops = getattr(self, "_dave_drops", 0) + 1
+        if self._dave_drops == 1 or self._dave_drops % 250 == 0:
+            logging.warning(
+                f"[Audio] {self._dave_drops} pacchetti vocali scartati (ssrc={self.ssrc}, motivo: {reason})"
+            )
+
     def _dave_decrypt_inner(self, packet: Any) -> bool:
         if packet.is_silence():
             return True
@@ -121,12 +129,14 @@ def patch_voice_recv_for_dave() -> None:
 
         session = getattr(state, "dave_session", None)
         if session is None or not session.ready:
+            self._count_dave_drop("sessione E2EE DAVE non pronta")
             return False
 
         user_id = self._cached_id
         if user_id is None:
             user_id = self._cached_id = vc._get_id_from_ssrc(self.ssrc)
         if user_id is None:
+            self._count_dave_drop("utente non ancora associato al flusso audio")
             return False
 
         try:
@@ -139,7 +149,7 @@ def patch_voice_recv_for_dave() -> None:
                 raise
             if "UnencryptedWhenPassthroughDisabled" in (str(e) or repr(e)):
                 return True
-            self._dave_drops = getattr(self, "_dave_drops", 0) + 1
+            self._count_dave_drop(f"decifratura E2EE fallita: {type(e).__name__}")
             return False
 
     def _dave_decrypt(self, packet: Any, *, peek: bool = False) -> bool:
@@ -208,6 +218,7 @@ def patch_voice_recv_for_dave() -> None:
 
     vr_opus.PacketDecoder.__init__ = _patched_init
     vr_opus.PacketDecoder.reset = _patched_reset
+    vr_opus.PacketDecoder._count_dave_drop = _count_dave_drop
     vr_opus.PacketDecoder._dave_decrypt_inner = _dave_decrypt_inner
     vr_opus.PacketDecoder._dave_decrypt = _dave_decrypt
     vr_opus.PacketDecoder._decode_safe = _decode_safe
@@ -753,6 +764,9 @@ class ItalianSpeechSink(voice_recv.AudioSink):
             if model and model not in self._gemini_models:
                 self._gemini_models.append(model)
         self._gemini_no_thinking_cfg: Set[str] = set()
+        # Modelli Whisper di Groq in pausa dopo un errore 429 (limite richieste del piano gratuito)
+        # (chiavi create subito: i thread aggiornano solo i valori, mai la dimensione del dizionario)
+        self._groq_cooldown_until: Dict[str, float] = {m: 0.0 for m in self._GROQ_WHISPER_MODELS}
 
         self._recognizer = sr.Recognizer()
         # Senza timeout una richiesta a Google bloccata terrebbe occupato un thread per sempre
@@ -853,53 +867,67 @@ class ItalianSpeechSink(voice_recv.AudioSink):
     def _flush_loop(self) -> None:
         while self._running:
             time.sleep(0.03)
-            now = time.monotonic()
-            to_finalize = []
-            to_speculate = []
+            try:
+                self._flush_once()
+            except Exception:
+                # Questo thread non deve morire mai: senza di lui il bot smetterebbe di sentire chiunque
+                # (e il watchdog non se ne accorgerebbe, perché l'ascolto risulta ancora attivo)
+                logging.exception("Errore nel ciclo di raccolta frasi vocali")
 
-            with self._lock:
-                for uid, entry in list(self._user_buffers.items()):
-                    silence_elapsed = now - entry["last_ts"]
-                    total_elapsed = now - entry["first_ts"]
-                    speech_elapsed = entry["last_ts"] - entry["first_ts"]
-                    threshold = (
-                        self.SHORT_SILENCE_FLUSH_SECONDS
-                        if speech_elapsed < self.SHORT_PHRASE_SECONDS
-                        else self.LONG_SILENCE_FLUSH_SECONDS
-                    )
-                    if (
-                        silence_elapsed >= threshold
-                        or total_elapsed >= self.MAX_PHRASE_SECONDS
-                    ):
-                        self._user_buffers.pop(uid, None)
-                        to_finalize.append(entry)
-                    elif (
-                        self.speculative_enabled
-                        and silence_elapsed >= self.SPECULATIVE_SILENCE_SECONDS
-                        and entry["spec_last_ts"] != entry["last_ts"]
-                        and entry["spec_count"] < self.MAX_SPECULATIONS_PER_PHRASE
-                    ):
-                        # L'utente si è fermato: trascrivi già adesso. Se riprende a parlare
-                        # il risultato viene scartato, altrimenti è pronto quando la frase si chiude.
-                        if entry["spec_future"] is not None:
-                            entry["spec_future"].cancel()  # la trascrizione anticipata precedente è superata
-                        entry["spec_last_ts"] = entry["last_ts"]
-                        entry["spec_count"] += 1
-                        entry["spec_future"] = None
-                        to_speculate.append((entry, bytes(entry["pcm"]), entry["last_ts"]))
+    def _flush_once(self) -> None:
+        now = time.monotonic()
+        to_finalize = []
+        to_speculate = []
 
-            for entry, pcm_bytes, spec_ts in to_speculate:
-                # Se in coda l'utente ha ripreso a parlare, salta le chiamate ai motori (risultato inutile)
-                is_stale = partial(lambda e, ts: e["last_ts"] != ts, entry, spec_ts)
-                try:
-                    entry["spec_future"] = self._executor.submit(
-                        self._transcribe, entry["user"], pcm_bytes, is_stale
-                    )
-                except RuntimeError:
-                    pass
+        with self._lock:
+            for uid, entry in list(self._user_buffers.items()):
+                silence_elapsed = now - entry["last_ts"]
+                total_elapsed = now - entry["first_ts"]
+                speech_elapsed = entry["last_ts"] - entry["first_ts"]
+                threshold = (
+                    self.SHORT_SILENCE_FLUSH_SECONDS
+                    if speech_elapsed < self.SHORT_PHRASE_SECONDS
+                    else self.LONG_SILENCE_FLUSH_SECONDS
+                )
+                if (
+                    silence_elapsed >= threshold
+                    or total_elapsed >= self.MAX_PHRASE_SECONDS
+                ):
+                    self._user_buffers.pop(uid, None)
+                    to_finalize.append(entry)
+                    if silence_elapsed < threshold:
+                        logging.info(
+                            f"[STT] Frase di {getattr(entry['user'], 'display_name', uid)} interrotta dopo "
+                            f"{self.MAX_PHRASE_SECONDS:.0f}s di audio continuo (rumore di fondo nel microfono?)"
+                        )
+                elif (
+                    self.speculative_enabled
+                    and not self._groq_rate_limited()
+                    and silence_elapsed >= self.SPECULATIVE_SILENCE_SECONDS
+                    and entry["spec_last_ts"] != entry["last_ts"]
+                    and entry["spec_count"] < self.MAX_SPECULATIONS_PER_PHRASE
+                ):
+                    # L'utente si è fermato: trascrivi già adesso. Se riprende a parlare
+                    # il risultato viene scartato, altrimenti è pronto quando la frase si chiude.
+                    if entry["spec_future"] is not None:
+                        entry["spec_future"].cancel()  # la trascrizione anticipata precedente è superata
+                    entry["spec_last_ts"] = entry["last_ts"]
+                    entry["spec_count"] += 1
+                    entry["spec_future"] = None
+                    to_speculate.append((entry, bytes(entry["pcm"]), entry["last_ts"]))
 
-            for entry in to_finalize:
-                self._finalize_utterance(entry)
+        for entry, pcm_bytes, spec_ts in to_speculate:
+            # Se in coda l'utente ha ripreso a parlare, salta le chiamate ai motori (risultato inutile)
+            is_stale = partial(lambda e, ts: e["last_ts"] != ts, entry, spec_ts)
+            try:
+                entry["spec_future"] = self._executor.submit(
+                    self._transcribe, entry["user"], pcm_bytes, is_stale
+                )
+            except RuntimeError:
+                pass
+
+        for entry in to_finalize:
+            self._finalize_utterance(entry)
 
     def _finalize_utterance(self, entry: Dict[str, Any]) -> None:
         user = entry["user"]
@@ -958,7 +986,14 @@ class ItalianSpeechSink(voice_recv.AudioSink):
             framed_pcm = pad + pcm_bytes + pad
 
             audio = sr.AudioData(framed_pcm, self.SAMPLE_RATE, self.SAMPLE_WIDTH)
-            return self._recognize_italian(audio, user)
+            text = self._recognize_italian(audio, user)
+            if not text and duration_sec >= 0.6 and (is_stale is None or not is_stale()):
+                # Utile per capire perché a volte "Venus" viene ignorato: c'era audio ma nessun motore l'ha capito
+                logging.info(
+                    f"[STT] Nessuna trascrizione per {duration_sec:.1f}s di audio di "
+                    f"{getattr(user, 'display_name', user)}"
+                )
+            return text
         except Exception as e:
             logging.debug(f"Errore elaborazione frase vocale: {e}")
             return None
@@ -1282,16 +1317,35 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                 for seg in segments
             ):
                 return True
-            # "Venus." da solo è valido (l'utente chiama l'assistente e aspetta), ma solo se Whisper è
-            # sicuro che ci fosse davvero una voce: evita attivazioni fantasma su tosse e rumori.
+            # "Venus." da solo è valido (l'utente chiama l'assistente e aspetta): scartalo solo se Whisper
+            # indica chiaramente che non c'era voce. Una parola singola ha spesso confidenza bassa,
+            # quindi una soglia troppo severa faceva ignorare proprio la chiamata "Venus".
             if only_prompt_words:
                 max_no_speech = max(_f(seg, "no_speech_prob", 0.0) for seg in segments)
                 min_logprob = min(_f(seg, "avg_logprob", 0.0) for seg in segments)
-                return max_no_speech > 0.4 or min_logprob < -0.9
+                return max_no_speech > 0.6 or min_logprob < -1.5
             return False
 
         # Senza metadati di confidenza mantieni il comportamento prudente
         return only_prompt_words
+
+    def _groq_rate_limited(self) -> bool:
+        now = time.monotonic()
+        return any(until > now for until in list(self._groq_cooldown_until.values()))
+
+    def _set_groq_cooldown(self, model: str, resp: requests.Response) -> None:
+        try:
+            wait_s = float(resp.headers.get("retry-after") or 20.0)
+        except ValueError:
+            wait_s = 20.0
+        wait_s = max(2.0, min(120.0, wait_s))
+        now = time.monotonic()
+        if self._groq_cooldown_until.get(model, 0.0) <= now:
+            logging.warning(
+                f"[STT] Groq {model}: limite di richieste raggiunto (429), lo salto per {wait_s:.0f}s. "
+                "Con il piano gratuito ogni frase detta nel canale conta come una richiesta."
+            )
+        self._groq_cooldown_until[model] = now + wait_s
 
     def _recognize_with_groq_whisper(
         self, wav_bytes: bytes, language: Optional[str] = "it", timeout: float = 3.8
@@ -1301,6 +1355,8 @@ class ItalianSpeechSink(voice_recv.AudioSink):
         clean_prompt = self._whisper_prompt(language)
 
         for w_model in self._GROQ_WHISPER_MODELS:
+            if self._groq_cooldown_until.get(w_model, 0.0) > time.monotonic():
+                continue  # in pausa per il limite richieste: prova l'altro modello (limite separato)
             try:
                 form_data = {
                     "model": w_model,
@@ -1324,10 +1380,14 @@ class ItalianSpeechSink(voice_recv.AudioSink):
                     if not text or self._is_whisper_hallucination(text, payload.get("segments"), clean_prompt):
                         return None
                     return text
+                elif resp.status_code == 429:
+                    self._set_groq_cooldown(w_model, resp)
+                    continue
                 elif resp.status_code in (401, 403, 404):
                     logging.debug(f"Groq Whisper ({w_model}) HTTP {resp.status_code}: {resp.text[:120]}")
                     continue
                 else:
+                    logging.debug(f"Groq Whisper ({w_model}) HTTP {resp.status_code}: {resp.text[:120]}")
                     break
             except Exception as e:
                 logging.debug(f"Groq Whisper STT ({w_model}) errore: {e}")

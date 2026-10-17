@@ -91,6 +91,26 @@ _GLUED_COMMAND_START = (
     r"|avanti|prossima|ripeti|mescola|esci|cerca|play|che|chi|come|quanto|dimmi|raccontami)"
 )
 
+# Parole che possono precedere la wake word senza che sia una semplice citazione in una frase
+# ("allora sì, Venus...", "ok ragazzi, Venus...")
+_LEADING_WORDS = ITALIAN_GREETING_PREFIXES | {
+    "si", "no", "e", "ma", "dai", "ecco", "beh", "ehm", "eh", "uhm", "mh", "comunque", "quindi", "poi",
+    "ora", "adesso", "ragazzi", "raga", "aspetta", "aspettate", "sentite", "guarda", "vabbe", "va", "bene",
+}
+
+# Inizio di un comando o di una domanda rivolta all'assistente: rende valida la wake word anche
+# a metà di una frase ("...ne parliamo dopo venus metti Vasco") o come vocativo finale
+# ("che ore sono, Venus?"). Niente "che"/"chi"/"come" da soli: sono troppo comuni nel parlato.
+_COMMAND_START = (
+    r"(?:metti(?:mi)?|mettere|riproduci|suona|pausa|salta|skip|stop|ferma|riprendi|continua|alza|abbassa"
+    r"|volume|basta|avanti|prossima|ripeti|ricomincia|mescola|esci|cerca|play|accendi|spegni|cambia|passa"
+    r"|che\s+(?:ore|ora|giorno|tempo|canzone|brano|musica|cos|cosa|data)|chi\s+(?:e|canta|ha|sono|era)"
+    r"|come\s+(?:si|stai|va|funziona|fai)|cos'?\s?e|cosa|quanto|quanti|quanta|quando|dove|perche|quale"
+    r"|dimmi|raccontami|spiegami|parlami|fammi|puoi|potresti|riesci|voglio|vorrei|sai|conosci|traduci|calcola"
+    r"|aiutami|ci\s+sei|mi\s+senti)\b"
+)
+_COMMAND_START_RE = re.compile(_COMMAND_START)
+
 DEFAULT_KEYWORDS_CONFIG = {
     "primary": "venus",
     "aliases": ["venere"],
@@ -324,17 +344,46 @@ class BotKeywords:
             remainder = re.sub(r"^[\s,.:;!?\-]+", "", cleaned_text[end_pos:]).strip()
             return True, kw, f"{remainder}{en_hint_suffix}".strip() if remainder else ""
 
-        # 1. Controllo regex diretto (senza accenti/maiuscole) all'inizio o nelle primissime parole
+        # 1. Controllo regex diretto (senza accenti/maiuscole) all'inizio della frase
         for kw in sorted_keywords:
             fkw = re.escape(_fold(kw))
             m = re.match(rf"(?:(?:{_PREFIXES_PATTERN})[\s,.:;!?]+)*({fkw})\b", folded)
             if m:
                 return _activated(kw, m.end(1))
 
-            # Controllo anche se la wake word è preceduta da massimo 1-2 parole nella frase
-            m2 = re.search(rf"\b({fkw})\b", folded)
-            if m2 and m2.start() <= 24:
-                return _activated(kw, m2.end(1))
+        # 1b. Wake word dentro una frase più lunga: succede quando l'utente dice "Venus" subito dopo
+        # aver parlato (pausa troppo breve, le due frasi arrivano insieme). Prima veniva cercata solo
+        # nei primi 24 caratteri, quindi "...ne parliamo dopo. Venus, metti Vasco" veniva ignorato.
+        for kw in sorted_keywords:
+            fkw = re.escape(_fold(kw))
+            for m2 in re.finditer(rf"\b({fkw})\b", folded):
+                before = folded[: m2.start()]
+                after = folded[m2.end():].lstrip(" ,.:;!?-")
+                before_words = re.findall(r"\w+", before)
+
+                # Inizio di una nuova frase (dopo . ! ?) o preceduta solo da intercalari/saluti
+                sentence_start = bool(re.search(r"[.!?]\s*$", before)) or all(
+                    w in _LEADING_WORDS for w in before_words
+                )
+                # Seguita da un comando o da una domanda ("venus metti...", "venus che ore sono")
+                if sentence_start or _COMMAND_START_RE.match(after):
+                    return _activated(kw, m2.end(1))
+
+                # Vocativo finale: "Che ore sono, Venus?" -> il comando è la frase PRIMA della wake word
+                if not after.strip() and before_words:
+                    before_text = re.sub(r"[\s,.:;!?\-]+$", "", cleaned_text[: m2.start()])
+                    last_sentence = re.split(r"(?<=[.!?])\s+", before_text)[-1].strip()
+                    folded_sentence = _fold(last_sentence)
+                    words = re.findall(r"\w+", folded_sentence)
+                    skip = 0
+                    while skip < len(words) and words[skip] in _LEADING_WORDS:
+                        skip += 1
+                    rest = " ".join(words[skip:])
+                    if rest and _COMMAND_START_RE.match(rest):
+                        return True, kw, f"{last_sentence}{en_hint_suffix}".strip()
+                    # "senti un attimo, Venus." (con la virgola di Whisper): chiamata senza comando
+                    if re.search(r"[,!?]\s*$", before):
+                        return True, kw, ""
 
         # 2. Wake word incollata al comando dal riconoscitore vocale ("venusmetti in pausa")
         for kw in sorted_keywords:

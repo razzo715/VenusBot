@@ -178,12 +178,23 @@ class MusicController:
         Controlla periodicamente che l'ascolto vocale (ItalianSpeechSink) sia sempre attivo
         mentre il bot è nel canale vocale, riavviandolo automaticamente se si interrompe.
         """
+        missed_checks = 0
         try:
             while True:
                 await asyncio.sleep(4.0)
                 if not self.isConnectedToVC():
-                    await self._cleanup_stale_voice_client()
-                    break
+                    # Durante una riconnessione vocale di Discord (cambio server, rete instabile) il
+                    # voice client risulta disconnesso per qualche secondo: pulisci solo se la connessione
+                    # non torna. Prima un controllo capitato in quel momento faceva uscire il bot dal canale.
+                    missed_checks += 1
+                    if missed_checks >= 3:
+                        logging.warning(
+                            f"[Watchdog Vocale] Connessione vocale persa su {self.guild.name}, pulizia sessione."
+                        )
+                        await self._cleanup_stale_voice_client()
+                        break
+                    continue
+                missed_checks = 0
 
                 voice_client = self._get_voice_client()
                 if (
@@ -879,10 +890,16 @@ class MusicController:
 
     async def startVoiceRecording(self):
         """Avvia l'ascolto continuo in italiano nel canale vocale."""
+        def _log_handler_error(fut) -> None:
+            # Senza questo controllo un errore nella gestione di un comando vocale spariva nel nulla
+            if not fut.cancelled() and fut.exception() is not None:
+                logging.error("Errore nella gestione di un comando vocale", exc_info=fut.exception())
+
         def on_transcription(user: discord.Member, text: str):
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self.handleTranscribedAudio(user, text), self.client.loop
             )
+            fut.add_done_callback(_log_handler_error)
 
         voice_client = self._get_voice_client()
         if not voice_client or not self.isConnectedToVC():
@@ -918,14 +935,18 @@ class MusicController:
             except Exception as e:
                 logging.debug(f"Errore invio trascrizione: {e}")
 
-        word_counters_data = await WordCounter().loadWordCounters()
-        keywords_map = word_counters_data[0] if word_counters_data else {}
-        text_lower = text.lower()
-        if any(
-            re.search(rf"\b{re.escape(kw)}\b", text_lower)
-            for kw in keywords_map.keys()
-        ):
-            await self.handle_word_counter_keyword(user, text_lower)
+        try:
+            word_counters_data = await WordCounter().loadWordCounters()
+            keywords_map = word_counters_data[0] if word_counters_data else {}
+            text_lower = text.lower()
+            if any(
+                re.search(rf"\b{re.escape(kw)}\b", text_lower)
+                for kw in keywords_map.keys()
+            ):
+                await self.handle_word_counter_keyword(user, text_lower)
+        except Exception as e:
+            # Un errore dei contatori (es. permessi del canale testuale) non deve bloccare l'assistente
+            logging.warning(f"Errore contatori parole: {e}")
 
         activated, matched_wake, remainder = self._keywords.extract_command_sync(text)
         force_song_mode = False

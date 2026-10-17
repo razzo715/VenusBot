@@ -125,6 +125,28 @@ class TestParolaDiAttivazione(unittest.TestCase):
         ):
             self.assertFalse(self.extract(text)[0], text)
 
+    def test_wake_word_dopo_altre_parole(self):
+        # L'utente dice "Venus" subito dopo aver parlato: le due frasi arrivano insieme allo STT
+        self.assertEqual(
+            self.extract("Sì, hai ragione, ne parliamo dopo. Venus, metti Vasco Rossi.")[2], "metti Vasco Rossi."
+        )
+        self.assertEqual(self.extract("va bene allora facciamo così venus metti in pausa")[2], "metti in pausa")
+        self.assertEqual(self.extract("aspetta che glielo chiedo io venus che ore sono")[2], "che ore sono")
+        self.assertEqual(self.extract("Ok ragazzi, adesso la mettiamo. Venus."), (True, "venus", ""))
+
+    def test_vocativo_finale(self):
+        self.assertEqual(self.extract("Che ore sono, Venus?"), (True, "venus", "Che ore sono"))
+        self.assertEqual(self.extract("metti vasco rossi venus"), (True, "venus", "metti vasco rossi"))
+
+    def test_citazioni_non_attivano(self):
+        for text in (
+            "Ieri ho visto Venus Williams in tv, è fortissima.",
+            "Ho chiesto a Venus di mettere qualcosa ma non ha capito",
+            "ieri ho parlato con venus",
+            "dici a venus che non funziona",
+        ):
+            self.assertFalse(self.extract(text)[0], text)
+
     def test_ipotesi_alternative(self):
         activated, _, remainder = self.extract("metti Vasco [EN_HINT: Venus put Vasco | venus metti vasco]")
         self.assertTrue(activated)
